@@ -1,152 +1,68 @@
+ecom-love-obs - 发货视频录制系统
 
----
+ecom-love-obs 是一个基于PySide6和OBS WebSockets的发货视频录制系统，专为电商发货流程设计，支持扫码自动录制、实时状态显示和数据持久化存储。
 
-# 📖 发货视频录制工具
+功能特性
 
-这是一个基于 **PySide6 + obsws-python (WebSocket v5)** 的桌面工具，结合 **条码枪** 扫描快递单号自动控制 **OBS Studio** 录制视频，并将信息保存到 SQLite 数据库。
+- 扫码录制: 通过条码枪扫描快递单号自动开始录制
+- 实时显示: 在OBS中显示当前单号、时间等信息
+- 自动管理: 自动按日期组织录制文件
+- 数据持久化: JSON格式存储每日录制记录
+- 超时保护: 防止长时间录制占用存储空间
+- 磁盘监控: 实时监控可用磁盘空间
 
----
+系统要求
 
-## ✨ 功能特性
+- Python 3.7+
+- OBS Studio (启用WebSockets插件)
+- Windows/macOS/Linux
 
-* ✅ **扫码开始录制**：
-  扫描快递单号并回车，自动开始录制，视频以单号命名。
+安装依赖
 
-* ✅ **重复扫码自动切换**：
-  如果正在录制，再次扫描新单号 → 自动停止并保存旧录制，同时立即开始新录制。
+pip install PySide6 obsws-python
 
-* ✅ **STOPSTOP 指令**：
-  输入 `STOPSTOP` 并回车 → 强制停止录制。
+配置说明
 
-* ✅ **手动停止按钮**：
-  界面有一个“停止录制”按钮，可手动停止。
+修改代码开头的配置参数：
 
-* ✅ **录制状态显示**：
+OBS_WS_HOST = "localhost"          # OBS WebSockets主机地址
+OBS_WS_PORT = 4455                 # OBS WebSockets端口
+OBS_WS_PASSWORD = "83vMnnkOgq0nHu6l" # OBS WebSockets密码
+RECORD_PATH = os.path.abspath("recordings")  # 录制文件存储路径
+MAX_RECORD_DURATION_MS = 20 * 60 * 1000      # 最大录制时长(毫秒)
+DISK_WARN_GB = 40                  # 磁盘警告阈值(GB)
+JSON_DIR = Path("records")         # JSON记录存储目录
 
-  * 录制中 → 绿色
-  * 保存中 → 蓝色
-  * 已停止 → 灰色
+使用方法
 
-* ✅ **文件名防重复**：
-  同单号多次录制自动生成 `(1)、(2)…` 后缀，避免覆盖。
+1. 启动OBS Studio并确保WebSockets插件已启用
+2. 运行Python脚本启动录制系统
+3. 扫描快递单号开始录制
+4. 系统会在OBS中显示当前单号和录制信息
+5. 录制完成后文件自动保存并记录到JSON数据库
 
-* ✅ **异步保存**：
-  文件保存/重命名在后台线程执行，不会卡顿界面。
+特殊命令
 
-* ✅ **日期目录管理**：
-  录制文件按日期保存：
+- 输入 STOPSTOP 并回车可手动停止录制
 
-  ```
-  recordings/2025-10-04/123456.mkv
-  recordings/2025-10-04/123456(1).mkv
-  ```
+数据存储
 
-* ✅ **场景显示**：
-  实时显示 OBS 当前场景。
+- 录制文件: recordings/YYYY-MM-DD/ 目录
+- 记录数据: records/YYYY-MM-DD.json 文件
 
-* ✅ **磁盘剩余空间监控**：
-  界面显示剩余磁盘空间：
+界面说明
 
-  * ≥40GB → 绿色
-  * <40GB → 红色
+- 主窗口: 控制录制流程和状态显示
+- OBS信息窗口: 显示单号、时间和录制时长
 
-* ✅ **数据库存储**：
-  每次录制自动写入 SQLite，内容包括：单号、录制时长、文件路径、大小、分辨率、帧率等。
-  数据库按日期存放：
+注意事项
 
-  ```
-  sql/2025-10-04/record.db
-  ```
+- 确保OBS WebSockets密码与配置一致
+- 在OBS中使用色度键滤镜去除绿色背景
+- 定期清理存储空间防止磁盘满载
 
----
+开源协议
 
-## 🛠️ 安装依赖
+MIT License
 
-1. 安装 Python 3.10+（推荐 3.11/3.12/3.13）
-2. 安装依赖：
-
-```bash
-pip install PySide6 obsws-python==1.8.0
-```
-
-> ⚠️ 必须使用 **obsws-python==1.8.0**，以支持 OBS WebSocket v5。
-
----
-
-## ⚙️ 使用方法
-
-1. 打开 **OBS Studio**，启用 **WebSocket 服务器**：
-
-   * 默认端口：4455
-   * 设置密码（与代码中的 `OBS_WS_PASSWORD` 一致）。
-
-2. 确认 OBS 设置 → 输出 → 录制路径 指向可写目录。
-
-3. 运行程序：
-
-```bash
-python recorder.py
-```
-
-4. 使用说明：
-
-   * 扫描单号并回车 → 开始录制
-   * 再次扫描新单号 → 自动停止旧录制并保存，同时开始新录制
-   * 输入 `STOPSTOP` → 停止录制
-   * 点击“停止录制”按钮 → 手动停止
-
-5. 视频文件保存路径：
-
-   ```
-   recordings/yyyy-mm-dd/单号.mkv
-   ```
-
----
-
-## 📂 文件结构
-
-```
-.
-├── recorder.py                # 主程序
-├── recordings/                # 保存录制视频
-│   └── 2025-10-04/            # 按日期划分目录
-│       ├── 123456.mkv
-│       └── 123456(1).mkv
-├── sql/                       # SQLite 数据库存储
-│   └── 2025-10-04/
-│       └── record.db
-```
-
----
-
-## 📝 数据库表结构
-
-表名：`records`
-
-| 字段名        | 类型        | 说明               |
-| ---------- | --------- | ---------------- |
-| id         | INTEGER   | 主键，自增            |
-| barcode    | TEXT      | 快递单号             |
-| start_time | TEXT      | 开始时间             |
-| end_time   | TEXT      | 结束时间             |
-| duration   | INTEGER   | 时长（秒）            |
-| video_path | TEXT      | 视频文件完整路径         |
-| file_size  | INTEGER   | 文件大小（字节）         |
-| resolution | TEXT      | 分辨率，例如 1920x1080 |
-| fps        | INTEGER   | 帧率               |
-| created_at | TIMESTAMP | 记录写入时间           |
-
----
-
-## 🚨 注意事项
-
-* 启动前确保 **OBS 已运行且 WebSocket 服务已启用**。
-* 磁盘空间不足会在界面显示红字提醒（<40GB）。
-* 遇到 `StartRecord returned code 500` 错误：
-
-  * 检查是否已有录制在进行中
-  * 检查 OBS 输出路径是否正确
-  * 检查编码器是否正常工作
-
----
-
+该项目适用于电商发货视频录制场景，可有效提高发货效率和视频管理自动化水平。
