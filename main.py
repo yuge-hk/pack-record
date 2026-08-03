@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
+import errno
 import time
-import sqlite3
+import json
 import threading
 import shutil
 from pathlib import Path
+from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit,
     QLabel, QTextEdit, QPushButton
@@ -17,50 +19,60 @@ import obsws_python as obs
 OBS_WS_HOST = "localhost"
 OBS_WS_PORT = 4455
 OBS_WS_PASSWORD = "83vMnnkOgq0nHu6l"
-RECORD_PATH = os.path.abspath("recordings")   # 基础目录
+BASE_DIR = Path(__file__).resolve().parent
+RECORD_PATH = str(BASE_DIR / "recordings")   # 基础目录
 MAX_RECORD_DURATION_MS = 20 * 60 * 1000       # 最长 20 分钟
 DISK_WARN_GB = 40                             # 磁盘小于40GB时变红色
+JSON_DIR = BASE_DIR / "records"
 
-if not os.path.exists(RECORD_PATH):
-    os.makedirs(RECORD_PATH, exist_ok=True)
+os.makedirs(RECORD_PATH, exist_ok=True)
+JSON_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------- SQLite 管理 ----------------
+# ---------------- JSON 数据管理 ----------------
 class VideoDB:
-    def __init__(self):
-        today_str = time.strftime("%Y-%m-%d")
-        self.db_path = Path("sql") / today_str
-        self.db_path.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path / "record.db")
-        self._create_table()
+    """按日期保存录制记录，并允许录制收尾线程安全写入。"""
 
-    def _create_table(self):
-        self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            barcode TEXT,
-            start_time TEXT,
-            end_time TEXT,
-            duration INTEGER,
-            video_path TEXT,
-            file_size INTEGER,
-            resolution TEXT,
-            fps INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-        self.conn.commit()
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _get_json_path():
+        return JSON_DIR / f"{time.strftime('%Y-%m-%d')}.json"
 
     def insert_record(self, barcode, start_time, end_time, duration,
                       video_path, file_size, resolution, fps):
-        self.conn.execute("""
-        INSERT INTO records(barcode, start_time, end_time, duration,
-                            video_path, file_size, resolution, fps)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (barcode, start_time, end_time, duration, video_path, file_size, resolution, fps))
-        self.conn.commit()
+        record = {
+            "barcode": barcode,
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration": duration,
+            "video_path": video_path,
+            "file_size": file_size,
+            "resolution": resolution,
+            "fps": fps,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        with self.lock:
+            path = self._get_json_path()
+            if path.exists():
+                try:
+                    records = json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(records, list):
+                        records = []
+                except (OSError, json.JSONDecodeError):
+                    records = []
+            else:
+                records = []
+            records.append(record)
+            temporary_path = path.with_suffix(".json.tmp")
+            temporary_path.write_text(
+                json.dumps(records, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, path)
 
     def close(self):
-        self.conn.close()
+        pass
 
 
 # ---------------- 工具函数 ----------------
@@ -73,6 +85,45 @@ def unique_filename(base_dir, filename):
         new_name = f"{name}({counter}){ext}"
         counter += 1
     return os.path.join(base_dir, new_name)
+
+
+def move_recording_file(source, destination, retries=10, retry_delay=0.5):
+    """移动 OBS 输出；同盘原子重命名，跨磁盘安全复制后删除源文件。"""
+    last_error = None
+    partial_destination = f"{destination}.part"
+    for _ in range(retries):
+        # 跨盘复制已经完成但源文件暂时无法删除时，只重试删除源文件。
+        if os.path.isfile(source) and os.path.isfile(destination):
+            try:
+                if os.path.getsize(source) == os.path.getsize(destination):
+                    os.unlink(source)
+                    return destination
+            except OSError as exc:
+                last_error = exc
+                time.sleep(retry_delay)
+                continue
+        try:
+            os.replace(source, destination)
+            return destination
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                last_error = exc
+                time.sleep(retry_delay)
+                continue
+        try:
+            shutil.copy2(source, partial_destination)
+            os.replace(partial_destination, destination)
+            os.unlink(source)
+            return destination
+        except OSError as exc:
+            last_error = exc
+            time.sleep(retry_delay)
+    try:
+        if os.path.exists(partial_destination):
+            os.unlink(partial_destination)
+    except OSError:
+        pass
+    raise RuntimeError(f"无法移动录制文件: {last_error}") from last_error
 
 
 # 全局 OBS 客户端
@@ -259,15 +310,12 @@ class RecorderApp(QWidget):
                     dst = unique_filename(date_dir, filename)
                     src = output_path
 
-                    for _ in range(10):
-                        try:
-                            os.replace(src, dst)
-                            self.log(f"录制完成：{dst}")
-                            break
-                        except PermissionError:
-                            time.sleep(0.5)
-                    else:
-                        self.log(f"录制完成，但无法重命名文件：{output_path}")
+                    try:
+                        move_recording_file(src, dst)
+                        self.log(f"录制完成：{dst}")
+                    except Exception as exc:
+                        self.log(f"录制完成，但无法移动文件：{output_path} ({exc})")
+                        return
 
                     # 数据库写入
                     end_time = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -292,7 +340,7 @@ class RecorderApp(QWidget):
                         self.current_tracking_number, self.start_time, end_time, duration,
                         dst, file_size, resolution, fps
                     )
-                    self.log(f"数据库已记录单号：{self.current_tracking_number}")
+                    self.log(f"JSON 已记录单号：{self.current_tracking_number}")
 
             finally:
                 self.current_tracking_number = None

@@ -7,20 +7,20 @@
 - **🔍 扫码录制**: 通过条码枪扫描快递单号自动开始录制 📱
 - **⏰ 实时显示**: 在OBS中显示当前单号、时间等信息 ⏱️
 - **📁 自动管理**: 自动按日期组织录制文件 📅
-- **💾 数据持久化**: JSON格式存储每日录制记录 🗄️
+- **💾 数据持久化**: JSON 格式存储每日录制记录 🗄️
 - **⏱️ 超时保护**: 防止长时间录制占用存储空间 ⏳
 - **📊 磁盘监控**: 实时监控可用磁盘空间 💾
 
 ## 🛠️ 系统要求
 
-- Python 3.7+ 👨‍💻
+- Python 3.9+ 👨‍💻
 - OBS Studio (启用WebSockets插件) 🎥
 - Windows/macOS/Linux 🖥️
 
 ## 🔧 安装依赖
 
 ```bash
-pip install PySide6 obsws-python 📦
+python -m pip install -r requirements.txt
 ```
 
 ## ⚙️ 配置说明
@@ -31,10 +31,10 @@ pip install PySide6 obsws-python 📦
 OBS_WS_HOST = "localhost"          # OBS WebSockets主机地址 🌐
 OBS_WS_PORT = 4455                 # OBS WebSockets端口 🚪
 OBS_WS_PASSWORD = "83vMnnkOgq0nHu6l" # OBS WebSockets密码 🔑
-RECORD_PATH = os.path.abspath("recordings")  # 录制文件存储路径 📁
+RECORD_PATH = str(BASE_DIR / "recordings")  # 录制文件存储路径 📁
 MAX_RECORD_DURATION_MS = 20 * 60 * 1000      # 最大录制时长(毫秒) ⏰
 DISK_WARN_GB = 40                  # 磁盘警告阈值(GB) ⚠️
-JSON_DIR = Path("records")         # JSON记录存储目录 📊
+JSON_DIR = BASE_DIR / "records"   # JSON记录存储目录 📊
 ```
 
 ## 🎯 使用方法
@@ -53,6 +53,14 @@ JSON_DIR = Path("records")         # JSON记录存储目录 📊
 
 - 📹 录制文件: `recordings/YYYY-MM-DD/` 目录
 - 📋 记录数据: `records/YYYY-MM-DD.json` 文件
+
+## 🧭 开发入口
+
+- `main.py`：当前唯一开发入口，使用每日 JSON 文件保存记录。
+- `archive/main_linux.py`：早期 Linux 实验版本，仅归档参考，不再继续开发。
+
+录制文件优先直接重命名；当 OBS 输出目录和 `recordings` 位于不同磁盘时，
+程序会自动改用复制后删除源文件的方式完成跨磁盘移动。
 
 ## 🖥️ 界面说明
 

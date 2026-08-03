@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# Runtime data
+recordings/
+records/
+sql/
+logs/
+*.log
+
+# Packaging and test caches
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
