@@ -2,10 +2,12 @@
 import sys
 import os
 import errno
+import csv
 import time
 import json
 import threading
 import shutil
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtWidgets import (
@@ -25,6 +27,10 @@ RECORD_PATH = str(BASE_DIR / "recordings")   # 基础目录
 MAX_RECORD_DURATION_MS = 20 * 60 * 1000       # 最长 20 分钟
 DISK_WARN_GB = 40                             # 磁盘小于40GB时变红色
 JSON_DIR = BASE_DIR / "records"
+OBS_EXECUTABLE_CANDIDATES = (
+    Path(r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"),
+    Path(r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe"),
+)
 
 os.makedirs(RECORD_PATH, exist_ok=True)
 JSON_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,6 +133,120 @@ def move_recording_file(source, destination, retries=10, retry_delay=0.5):
     raise RuntimeError(f"无法移动录制文件: {last_error}") from last_error
 
 
+def find_obs_executable():
+    """查找 Windows 上的 OBS 主程序，不依赖额外配置。"""
+    executable_on_path = shutil.which("obs64.exe")
+    if executable_on_path:
+        return Path(executable_on_path)
+    for candidate in OBS_EXECUTABLE_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def get_obs_process_ids():
+    """返回当前 Windows 会话中的 obs64.exe 进程 ID。"""
+    if sys.platform != "win32":
+        return set()
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/FO", "CSV", "/NH"],
+            text=True,
+            encoding="mbcs",
+            errors="ignore",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+
+    process_ids = set()
+    for row in csv.reader(output.splitlines()):
+        if len(row) >= 2 and row[0].lower() == "obs64.exe":
+            try:
+                process_ids.add(int(row[1]))
+            except ValueError:
+                pass
+    return process_ids
+
+
+def find_largest_window_for_processes(process_ids):
+    """查找指定进程集合中面积最大的可见顶层窗口。"""
+    if sys.platform != "win32" or not process_ids:
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG),
+            ("top", wintypes.LONG),
+            ("right", wintypes.LONG),
+            ("bottom", wintypes.LONG),
+        ]
+
+    windows = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+
+    @callback_type
+    def enum_window(window_handle, _):
+        if not user32.IsWindowVisible(window_handle):
+            return True
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window_handle, ctypes.byref(process_id))
+        if process_id.value not in process_ids:
+            return True
+        rectangle = RECT()
+        if user32.GetWindowRect(window_handle, ctypes.byref(rectangle)):
+            width = max(0, rectangle.right - rectangle.left)
+            height = max(0, rectangle.bottom - rectangle.top)
+            if width >= 300 and height >= 200:
+                title_length = user32.GetWindowTextLengthW(window_handle)
+                title_buffer = ctypes.create_unicode_buffer(title_length + 1)
+                user32.GetWindowTextW(window_handle, title_buffer, title_length + 1)
+                title = title_buffer.value.upper()
+                main_window_priority = int("OBS" in title and "PROJECTOR" not in title)
+                windows.append((main_window_priority, width * height, window_handle))
+        return True
+
+    user32.EnumWindows(enum_window, 0)
+    return max(windows, default=(0, 0, None), key=lambda item: (item[0], item[1]))[2]
+
+
+def move_windows_window(window_handle, x, y, width, height):
+    """恢复并移动一个 Windows 顶层窗口。"""
+    if sys.platform != "win32" or not window_handle:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.MoveWindow.argtypes = [
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.BOOL,
+    ]
+    user32.MoveWindow.restype = wintypes.BOOL
+    user32.ShowWindow(window_handle, 9)  # SW_RESTORE
+    return bool(user32.MoveWindow(window_handle, x, y, width, height, True))
+
+
 db = VideoDB()
 
 
@@ -227,6 +347,9 @@ class RecorderApp(QWidget):
 
         self.stop_button = QPushButton("停止录制")
         self.stop_button.clicked.connect(self.stop_recording)
+        self.stop_button.clicked.connect(
+            lambda _checked=False: QTimer.singleShot(0, self.focus_scan_input)
+        )
         layout.addWidget(self.stop_button)
 
         self.display_checkbox = QCheckBox("显示 OBS 信息窗口")
@@ -291,9 +414,16 @@ class RecorderApp(QWidget):
         self.event_client = None
         self.connection_in_progress = False
         self.connection_error_logged = False
+        self.obs_process = None
+        self.windows_arranged = False
+        self.window_arrange_attempts = 0
+
+        self.window_arrange_timer = QTimer(self)
+        self.window_arrange_timer.setInterval(500)
+        self.window_arrange_timer.timeout.connect(self._try_arrange_windows)
 
         self.display_window = OBSDisplayWindow()
-        self.display_checkbox.toggled.connect(self.display_window.setVisible)
+        self.display_checkbox.toggled.connect(self._set_display_window_visible)
         self.display_window.hide_requested.connect(
             lambda: self.display_checkbox.setChecked(False)
         )
@@ -304,6 +434,8 @@ class RecorderApp(QWidget):
         self.worker_log.connect(self.log)
         self.recording_finalized.connect(self._on_recording_finalized)
         QTimer.singleShot(0, self.ensure_obs_connection)
+        QTimer.singleShot(0, self.launch_obs_and_prepare_windows)
+        QTimer.singleShot(100, self.focus_scan_input)
 
     # ---------------- UI辅助 ----------------
     def log(self, msg: str):
@@ -335,6 +467,93 @@ class RecorderApp(QWidget):
             self.current_tracking_number,
             self.start_time,
         )
+
+    # ---------------- Windows 窗口管理 ----------------
+    def _set_display_window_visible(self, visible):
+        self.display_window.setVisible(visible)
+        QTimer.singleShot(100, self.focus_scan_input)
+
+    def focus_scan_input(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.input.setFocus(Qt.OtherFocusReason)
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                user32 = ctypes.windll.user32
+                user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+                user32.SetForegroundWindow(int(self.winId()))
+            except Exception:
+                pass
+
+    def launch_obs_and_prepare_windows(self):
+        if sys.platform != "win32":
+            self.focus_scan_input()
+            return
+
+        if not get_obs_process_ids():
+            executable = find_obs_executable()
+            if executable is None:
+                self.log("未找到 OBS 安装目录，请手动启动 OBS；连接恢复后会继续运行")
+            else:
+                try:
+                    self.obs_process = subprocess.Popen(
+                        [str(executable)],
+                        cwd=str(executable.parent),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    self.log(f"已启动 OBS：{executable}")
+                except OSError as exc:
+                    self.log(f"无法启动 OBS，请手动打开：{exc}")
+        self.start_window_arrangement()
+
+    def start_window_arrangement(self):
+        if sys.platform != "win32" or self.windows_arranged:
+            return
+        self.window_arrange_attempts = 0
+        if not self.window_arrange_timer.isActive():
+            self.window_arrange_timer.start()
+        self._try_arrange_windows()
+
+    def _try_arrange_windows(self):
+        if sys.platform != "win32":
+            self.window_arrange_timer.stop()
+            return
+
+        self.window_arrange_attempts += 1
+        obs_window = find_largest_window_for_processes(get_obs_process_ids())
+        if obs_window:
+            screen = self.screen() or QApplication.primaryScreen()
+            geometry = screen.availableGeometry()
+            left_width = geometry.width() // 2
+            right_width = geometry.width() - left_width
+            self.setGeometry(
+                geometry.x(),
+                geometry.y(),
+                left_width,
+                geometry.height(),
+            )
+            moved = move_windows_window(
+                obs_window,
+                geometry.x() + left_width,
+                geometry.y(),
+                right_width,
+                geometry.height(),
+            )
+            if moved:
+                self.windows_arranged = True
+                self.window_arrange_timer.stop()
+                self.log("窗口已排列：录制控制在左，OBS 在右")
+                QTimer.singleShot(300, self.focus_scan_input)
+                return
+
+        if self.window_arrange_attempts >= 60:
+            self.window_arrange_timer.stop()
+            self.log("暂未找到 OBS 主窗口，连接成功后会再次尝试排列")
+            self.focus_scan_input()
 
     # ---------------- OBS 连接管理 ----------------
     def ensure_obs_connection(self):
@@ -398,6 +617,7 @@ class RecorderApp(QWidget):
             self.log("OBS WebSocket 已连接，事件监听不可用，将使用状态轮询")
         else:
             self.log("OBS WebSocket 已连接")
+        self.start_window_arrangement()
         self.poll_obs_status()
         if self.stop_requested and self.current_tracking_number is not None:
             self.stop_requested = False
@@ -449,6 +669,8 @@ class RecorderApp(QWidget):
         self.req_client = None
         self.connection_in_progress = False
         self.current_scene = "-"
+        self.windows_arranged = False
+        self.start_window_arrangement()
         self.obs_connection_label.setText("OBS 连接：连接已断开，等待重连")
         self.obs_connection_label.setStyleSheet("font-size: 14px; color: #b7791f;")
         self.log(f"OBS 连接已断开，程序将自动重连：{reason}")
@@ -626,6 +848,7 @@ class RecorderApp(QWidget):
 
     def closeEvent(self, event):
         self.reconnect_timer.stop()
+        self.window_arrange_timer.stop()
         self.poll_timer.stop()
         self.disk_timer.stop()
         self.timer.stop()
