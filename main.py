@@ -1,22 +1,31 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
-import errno
 import csv
+import logging
 import time
-import json
 import threading
 import shutil
 import subprocess
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit,
-    QLabel, QTextEdit, QPushButton, QCheckBox, QHBoxLayout
+    QLabel, QTextEdit, QPushButton, QCheckBox, QHBoxLayout,
+    QMessageBox, QInputDialog
 )
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal, QEvent
 from PySide6.QtGui import QFont
 import obsws_python as obs
+from app_core import (
+    FailedJobStore,
+    VideoDB,
+    ensure_copy_space,
+    move_recording_file,
+    sanitize_tracking_filename,
+    unique_filename,
+)
 
 # ================= 配置 =================
 OBS_WS_HOST = "localhost"
@@ -26,10 +35,14 @@ BASE_DIR = Path(__file__).resolve().parent
 RECORD_PATH = str(BASE_DIR / "recordings")   # 基础目录
 MAX_RECORD_DURATION_MS = 20 * 60 * 1000       # 最长 20 分钟
 DISK_WARN_GB = 40                             # 磁盘小于40GB时变红色
+DISK_CRITICAL_GB = 10                         # 磁盘小于10GB时禁止新录制
+DISK_COPY_RESERVE_GB = 1                      # 跨盘保存时额外预留1GB
 RECORD_START_CONFIRM_INTERVAL_MS = 100
 RECORD_START_CONFIRM_ATTEMPTS = 50
 DUPLICATE_SCAN_WINDOW_SECONDS = 1.0
 JSON_DIR = BASE_DIR / "records"
+LOG_DIR = BASE_DIR / "logs"
+FAILED_JOBS_PATH = JSON_DIR / "failed_jobs.json"
 OBS_EXECUTABLE_CANDIDATES = (
     Path(r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"),
     Path(r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe"),
@@ -37,104 +50,21 @@ OBS_EXECUTABLE_CANDIDATES = (
 
 os.makedirs(RECORD_PATH, exist_ok=True)
 JSON_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------- JSON 数据管理 ----------------
-class VideoDB:
-    """按日期保存录制记录，并允许录制收尾线程安全写入。"""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-
-    @staticmethod
-    def _get_json_path():
-        return JSON_DIR / f"{time.strftime('%Y-%m-%d')}.json"
-
-    def insert_record(self, barcode, start_time, end_time, duration,
-                      video_path, file_size, resolution, fps):
-        record = {
-            "barcode": barcode,
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration": duration,
-            "video_path": video_path,
-            "file_size": file_size,
-            "resolution": resolution,
-            "fps": fps,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        with self.lock:
-            path = self._get_json_path()
-            if path.exists():
-                try:
-                    records = json.loads(path.read_text(encoding="utf-8"))
-                    if not isinstance(records, list):
-                        records = []
-                except (OSError, json.JSONDecodeError):
-                    records = []
-            else:
-                records = []
-            records.append(record)
-            temporary_path = path.with_suffix(".json.tmp")
-            temporary_path.write_text(
-                json.dumps(records, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            os.replace(temporary_path, path)
-
-    def close(self):
-        pass
-
-
-# ---------------- 工具函数 ----------------
-def unique_filename(base_dir, filename):
-    """在 base_dir 下生成不重复的文件名"""
-    name, ext = os.path.splitext(filename)
-    counter = 1
-    new_name = filename
-    while os.path.exists(os.path.join(base_dir, new_name)):
-        new_name = f"{name}({counter}){ext}"
-        counter += 1
-    return os.path.join(base_dir, new_name)
-
-
-def move_recording_file(source, destination, retries=10, retry_delay=0.5):
-    """移动 OBS 输出；同盘原子重命名，跨磁盘安全复制后删除源文件。"""
-    last_error = None
-    partial_destination = f"{destination}.part"
-    for _ in range(retries):
-        # 跨盘复制已经完成但源文件暂时无法删除时，只重试删除源文件。
-        if os.path.isfile(source) and os.path.isfile(destination):
-            try:
-                if os.path.getsize(source) == os.path.getsize(destination):
-                    os.unlink(source)
-                    return destination
-            except OSError as exc:
-                last_error = exc
-                time.sleep(retry_delay)
-                continue
-        try:
-            os.replace(source, destination)
-            return destination
-        except OSError as exc:
-            if exc.errno != errno.EXDEV:
-                last_error = exc
-                time.sleep(retry_delay)
-                continue
-        try:
-            shutil.copy2(source, partial_destination)
-            os.replace(partial_destination, destination)
-            os.unlink(source)
-            return destination
-        except OSError as exc:
-            last_error = exc
-            time.sleep(retry_delay)
-    try:
-        if os.path.exists(partial_destination):
-            os.unlink(partial_destination)
-    except OSError:
-        pass
-    raise RuntimeError(f"无法移动录制文件: {last_error}") from last_error
-
+logger = logging.getLogger("ecom-love-obs")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    file_handler = RotatingFileHandler(
+        LOG_DIR / "app.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    logger.addHandler(file_handler)
 
 def find_obs_executable():
     """查找 Windows 上的 OBS 主程序，不依赖额外配置。"""
@@ -250,7 +180,33 @@ def move_windows_window(window_handle, x, y, width, height):
     return bool(user32.MoveWindow(window_handle, x, y, width, height, True))
 
 
-db = VideoDB()
+db = VideoDB(JSON_DIR)
+failed_jobs = FailedJobStore(FAILED_JOBS_PATH)
+INSTANCE_MUTEX_HANDLE = None
+
+
+def acquire_single_instance():
+    """Windows 下只允许启动一个录制控制程序实例。"""
+    global INSTANCE_MUTEX_HANDLE
+    if sys.platform != "win32":
+        return True
+
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(
+        None,
+        False,
+        "Local\\ecom-love-obs-single-instance",
+    )
+    if not handle:
+        return True
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return False
+    INSTANCE_MUTEX_HANDLE = handle
+    return True
 
 
 class OBSDisplayWindow(QWidget):
@@ -297,6 +253,7 @@ class OBSDisplayWindow(QWidget):
         layout.addLayout(time_layout)
 
         self.setLayout(layout)
+        self.disk_free_gb = None
         self.recording_started_at = None
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self.update_clock)
@@ -331,7 +288,8 @@ class RecorderApp(QWidget):
     obs_connection_failed = Signal(str)
     obs_scene_changed = Signal(str)
     worker_log = Signal(str)
-    recording_finalized = Signal(object)
+    recording_finalized = Signal(object, bool, str)
+    failed_jobs_retry_finished = Signal(int, int)
 
     def __init__(self):
         super().__init__()
@@ -380,6 +338,24 @@ class RecorderApp(QWidget):
         self.disk_label.setStyleSheet("font-size: 14px; color: green;")
         layout.addWidget(self.disk_label)
 
+        self.pending_label = QLabel("最新待处理单号：-")
+        self.pending_label.setStyleSheet("font-size: 14px; color: #805ad5;")
+        layout.addWidget(self.pending_label)
+
+        self.failed_jobs_label = QLabel("待恢复文件：0")
+        self.failed_jobs_label.setStyleSheet("font-size: 14px; color: gray;")
+        layout.addWidget(self.failed_jobs_label)
+
+        recovery_buttons = QHBoxLayout()
+        self.retry_failed_button = QPushButton("重试保存失败任务")
+        self.retry_failed_button.clicked.connect(self.retry_failed_jobs)
+        recovery_buttons.addWidget(self.retry_failed_button)
+        self.resolve_orphan_button = QPushButton("处理 OBS 当前录像")
+        self.resolve_orphan_button.clicked.connect(self.resolve_orphan_recording)
+        self.resolve_orphan_button.hide()
+        recovery_buttons.addWidget(self.resolve_orphan_button)
+        layout.addLayout(recovery_buttons)
+
         # ===== 日志区 =====
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -417,6 +393,10 @@ class RecorderApp(QWidget):
         self.stop_requested = False
         self.last_scan_number = None
         self.last_scan_monotonic = 0.0
+        self.scanner_buffer = ""
+        self.exit_after_finalize = False
+        self.force_closing = False
+        self.orphan_recording_blocked = False
         self.req_client = None
         self.event_client = None
         self.connection_in_progress = False
@@ -429,6 +409,11 @@ class RecorderApp(QWidget):
         self.window_arrange_timer.setInterval(500)
         self.window_arrange_timer.timeout.connect(self._try_arrange_windows)
 
+        self.scanner_buffer_timer = QTimer(self)
+        self.scanner_buffer_timer.setSingleShot(True)
+        self.scanner_buffer_timer.setInterval(300)
+        self.scanner_buffer_timer.timeout.connect(self._clear_scanner_buffer)
+
         self.display_window = OBSDisplayWindow()
         self.display_checkbox.toggled.connect(self._set_display_window_visible)
         self.display_window.hide_requested.connect(
@@ -440,6 +425,9 @@ class RecorderApp(QWidget):
         self.obs_scene_changed.connect(self._on_obs_scene_changed)
         self.worker_log.connect(self.log)
         self.recording_finalized.connect(self._on_recording_finalized)
+        self.failed_jobs_retry_finished.connect(self._on_failed_jobs_retry_finished)
+        QApplication.instance().installEventFilter(self)
+        self.update_failed_jobs_status()
         QTimer.singleShot(0, self.ensure_obs_connection)
         QTimer.singleShot(0, self.launch_obs_and_prepare_windows)
         QTimer.singleShot(100, self.focus_scan_input)
@@ -450,7 +438,37 @@ class RecorderApp(QWidget):
         line = f"[{timestamp}] {msg}"
         self.log_box.append(line)
         print(line)
+        logger.info(msg)
         self.update_info()
+
+    def _clear_scanner_buffer(self):
+        self.scanner_buffer = ""
+
+    def eventFilter(self, watched, event):
+        if (
+            event.type() != QEvent.KeyPress
+            or watched is self.input
+            or QApplication.activeModalWidget() is not None
+        ):
+            return super().eventFilter(watched, event)
+
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            if self.scanner_buffer:
+                tracking_number = self.scanner_buffer
+                self._clear_scanner_buffer()
+                self.input.setText(tracking_number)
+                self.handle_input()
+                return True
+            return super().eventFilter(watched, event)
+
+        blocked_modifiers = Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
+        text = event.text()
+        if text and text.isprintable() and not (event.modifiers() & blocked_modifiers):
+            self.scanner_buffer += text
+            self.scanner_buffer_timer.start()
+            return True
+        return super().eventFilter(watched, event)
 
     def set_state(self, state: str):
         if state == "录制中":
@@ -474,6 +492,171 @@ class RecorderApp(QWidget):
             self.current_tracking_number,
             self.start_time,
         )
+
+    def set_pending_tracking(self, tracking_number):
+        """只保留最新一次扫描，不建立扫码队列。"""
+        self.pending_tracking_number = tracking_number or None
+        self.pending_label.setText(
+            f"最新待处理单号：{self.pending_tracking_number or '-'}"
+        )
+
+    def update_failed_jobs_status(self):
+        count = failed_jobs.count()
+        self.failed_jobs_label.setText(f"待恢复文件：{count}")
+        color = "red" if count else "gray"
+        self.failed_jobs_label.setStyleSheet(
+            f"font-size: 14px; color: {color};"
+        )
+        self.retry_failed_button.setEnabled(count > 0)
+
+    @staticmethod
+    def _failed_job_payload(
+        tracking_number,
+        source_path,
+        start_time,
+        end_time,
+        duration,
+        resolution,
+        fps,
+        error,
+        archived_path=None,
+    ):
+        return {
+            "tracking_number": tracking_number,
+            "source_path": source_path,
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration": duration,
+            "resolution": resolution,
+            "fps": fps,
+            "last_error": str(error),
+            "archived_path": archived_path,
+        }
+
+    def retry_failed_jobs(self):
+        self.retry_failed_button.setEnabled(False)
+        self.log("正在重试保存失败任务…")
+        threading.Thread(target=self._retry_failed_jobs_worker, daemon=True).start()
+
+    def _retry_failed_jobs_worker(self):
+        remaining = []
+        succeeded = 0
+        jobs_to_retry = failed_jobs.list()
+        processed_ids = {job.get("id") for job in jobs_to_retry}
+        for job in jobs_to_retry:
+            source_path = job.get("source_path")
+            try:
+                archived_path = job.get("archived_path")
+                if archived_path and os.path.isfile(archived_path):
+                    destination = archived_path
+                else:
+                    if not source_path or not os.path.isfile(source_path):
+                        raise FileNotFoundError("OBS 输出文件不存在，需人工检查 OBS 输出目录")
+                    date_text = (job.get("end_time") or time.strftime("%Y-%m-%d"))[:10]
+                    date_dir = os.path.join(RECORD_PATH, date_text)
+                    os.makedirs(date_dir, exist_ok=True)
+                    extension = os.path.splitext(source_path)[1] or ".mkv"
+                    filename = f"{sanitize_tracking_filename(job.get('tracking_number'))}{extension}"
+                    destination = unique_filename(date_dir, filename)
+                    ensure_copy_space(source_path, date_dir, DISK_COPY_RESERVE_GB)
+                    move_recording_file(source_path, destination)
+                file_size = os.path.getsize(destination)
+                db.insert_record(
+                    job.get("tracking_number"),
+                    job.get("start_time"),
+                    job.get("end_time"),
+                    job.get("duration"),
+                    destination,
+                    file_size,
+                    job.get("resolution", "-"),
+                    job.get("fps", 0),
+                )
+                succeeded += 1
+                self.worker_log.emit(
+                    f"失败任务已恢复：{job.get('tracking_number')} → {destination}"
+                )
+            except Exception as exc:
+                job["last_error"] = str(exc)
+                job["last_retry_at"] = datetime.now().isoformat(timespec="seconds")
+                remaining.append(job)
+                self.worker_log.emit(
+                    f"失败任务仍无法保存：{job.get('tracking_number')} ({exc})"
+                )
+        failed_jobs.finish_retry(processed_ids, remaining)
+        self.failed_jobs_retry_finished.emit(succeeded, failed_jobs.count())
+
+    def _on_failed_jobs_retry_finished(self, succeeded, remaining):
+        self.update_failed_jobs_status()
+        self.log(f"失败任务重试完成：成功 {succeeded}，剩余 {remaining}")
+        if remaining:
+            QMessageBox.warning(
+                self,
+                "仍有文件未恢复",
+                f"成功恢复 {succeeded} 个，仍有 {remaining} 个。请检查磁盘空间和 OBS 输出目录。",
+            )
+
+    def resolve_orphan_recording(self):
+        """处理程序启动前已经由 OBS 开始的录像。"""
+        client = self.req_client
+        if client is None:
+            return
+        try:
+            status = client.get_record_status()
+            if not bool(getattr(status, "output_active", False)):
+                self.orphan_recording_blocked = False
+                self.resolve_orphan_button.hide()
+                self.set_state("已停止")
+                return
+        except Exception as exc:
+            self.mark_obs_disconnected(exc)
+            return
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("检测到 OBS 正在录制")
+        dialog.setText("OBS 已在录制，但程序不知道对应单号。请选择处理方式。")
+        takeover_button = dialog.addButton("接管当前录像", QMessageBox.AcceptRole)
+        stop_button = dialog.addButton("停止并保存孤立录像", QMessageBox.DestructiveRole)
+        keep_button = dialog.addButton("保持录制并暂不处理", QMessageBox.RejectRole)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+
+        if clicked is takeover_button:
+            tracking_number, accepted = QInputDialog.getText(
+                self,
+                "接管 OBS 录像",
+                "请输入当前录像对应的快递单号：",
+            )
+            tracking_number = tracking_number.strip()
+            if not accepted or not tracking_number:
+                self.orphan_recording_blocked = True
+                self.resolve_orphan_button.show()
+                self.set_state("OBS 已在录制，扫码禁用")
+                return
+            self.current_tracking_number = tracking_number
+            self.start_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.recording_phase = "recording"
+            self.orphan_recording_blocked = False
+            self.resolve_orphan_button.hide()
+            self.timer.start(MAX_RECORD_DURATION_MS)
+            self.set_state("录制中")
+            self.log(f"已接管 OBS 当前录像：{tracking_number}（开始时间按接管时刻计算）")
+            return
+
+        if clicked is stop_button:
+            self.current_tracking_number = f"ORPHAN_{datetime.now():%Y%m%d_%H%M%S}"
+            self.start_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.recording_phase = "recording"
+            self.orphan_recording_blocked = False
+            self.resolve_orphan_button.hide()
+            self.log("正在停止并保存启动前已存在的 OBS 录像")
+            self.stop_recording()
+            return
+
+        if clicked is keep_button:
+            self.orphan_recording_blocked = True
+            self.resolve_orphan_button.show()
+            self.set_state("OBS 已在录制，扫码禁用")
+            self.log("OBS 当前录像保持运行；处理前扫码功能已禁用")
 
     # ---------------- Windows 窗口管理 ----------------
     def _set_display_window_visible(self, visible):
@@ -629,10 +812,19 @@ class RecorderApp(QWidget):
         if self.current_tracking_number is not None:
             QTimer.singleShot(0, self._resume_recording_after_reconnect)
             return
+        try:
+            status = request_client.get_record_status()
+            obs_is_recording = bool(getattr(status, "output_active", False))
+        except Exception as exc:
+            self.mark_obs_disconnected(exc)
+            return
+        if obs_is_recording:
+            self.resolve_orphan_recording()
+            return
         if self.pending_tracking_number and self.current_tracking_number is None:
             tracking_number = self.pending_tracking_number
-            self.pending_tracking_number = None
-            QTimer.singleShot(0, lambda: self.start_recording(tracking_number))
+            self.set_pending_tracking(None)
+            self.start_recording(tracking_number)
 
     def _on_obs_connection_failed(self, error_message):
         self.connection_in_progress = False
@@ -714,12 +906,19 @@ class RecorderApp(QWidget):
         try:
             usage = shutil.disk_usage(RECORD_PATH)
             free_gb = usage.free / (1024**3)
-            if free_gb < DISK_WARN_GB:
+            self.disk_free_gb = free_gb
+            if free_gb < DISK_CRITICAL_GB:
                 self.disk_label.setStyleSheet("font-size: 14px; color: red; font-weight: bold;")
+                suffix = "（空间不足，禁止新录制）"
+            elif free_gb < DISK_WARN_GB:
+                self.disk_label.setStyleSheet("font-size: 14px; color: #b7791f; font-weight: bold;")
+                suffix = "（请尽快清理）"
             else:
                 self.disk_label.setStyleSheet("font-size: 14px; color: green;")
-            self.disk_label.setText(f"磁盘剩余：{free_gb:.1f} GB")
+                suffix = ""
+            self.disk_label.setText(f"磁盘剩余：{free_gb:.1f} GB {suffix}")
         except Exception as e:
+            self.disk_free_gb = None
             self.disk_label.setText(f"磁盘剩余：未知 ({e})")
             self.disk_label.setStyleSheet("font-size: 14px; color: gray;")
 
@@ -736,6 +935,10 @@ class RecorderApp(QWidget):
             self.stop_recording()
             return
 
+        if self.orphan_recording_blocked:
+            self.log(f"OBS 存在未处理录像，忽略扫码：{tracking_number}")
+            return
+
         scan_time = time.monotonic()
         if (
             tracking_number == self.last_scan_number
@@ -750,7 +953,7 @@ class RecorderApp(QWidget):
             return
 
         if self.req_client is None:
-            self.pending_tracking_number = tracking_number
+            self.set_pending_tracking(tracking_number)
             if self.current_tracking_number is not None:
                 self.stop_requested = True
                 self.log(f"OBS 暂时离线，已暂存下一单号：{tracking_number}")
@@ -761,10 +964,10 @@ class RecorderApp(QWidget):
         if self.recording_phase == "idle" and self.current_tracking_number is None:
             self.start_recording(tracking_number)
         elif self.recording_phase == "starting":
-            self.pending_tracking_number = tracking_number
+            self.set_pending_tracking(tracking_number)
             self.log(f"OBS 正在启动录制，已暂存下一单号：{tracking_number}")
         elif self.recording_phase in ("stopping", "saving"):
-            self.pending_tracking_number = tracking_number
+            self.set_pending_tracking(tracking_number)
             self.log(f"上一单正在保存，已暂存下一单号：{tracking_number}")
         else:
             self.stop_recording(start_new_tracking_number=tracking_number)
@@ -772,18 +975,29 @@ class RecorderApp(QWidget):
     def start_recording(self, tracking_number):
         if self.recording_phase != "idle" or self.current_tracking_number is not None:
             if tracking_number != self.current_tracking_number:
-                self.pending_tracking_number = tracking_number
+                self.set_pending_tracking(tracking_number)
                 self.log(f"当前状态暂不能启动，已暂存单号：{tracking_number}")
             return
         client = self.req_client
         if client is None:
-            self.pending_tracking_number = tracking_number
+            self.set_pending_tracking(tracking_number)
             self.ensure_obs_connection()
+            return
+        self.update_disk_space()
+        if self.disk_free_gb is not None and self.disk_free_gb < DISK_CRITICAL_GB:
+            self.log(
+                f"磁盘仅剩 {self.disk_free_gb:.1f} GB，低于 {DISK_CRITICAL_GB} GB，"
+                "已禁止开始录制"
+            )
             return
         try:
             status = client.get_record_status()
             if getattr(status, "output_active", False):
-                self.log("⚠️ OBS 已在录制中，无法再次开始")
+                self.set_pending_tracking(tracking_number)
+                self.orphan_recording_blocked = True
+                self.resolve_orphan_button.show()
+                self.log("⚠️ OBS 已在录制中，已保留最新单号并等待处理当前录像")
+                QTimer.singleShot(0, self.resolve_orphan_recording)
                 return
             client.start_record()
             self.current_tracking_number = tracking_number
@@ -851,7 +1065,11 @@ class RecorderApp(QWidget):
         )
         self._reset_recording_state_and_continue()
 
-    def _reset_recording_state_and_continue(self, requested_next_tracking_number=None):
+    def _reset_recording_state_and_continue(
+        self,
+        requested_next_tracking_number=None,
+        allow_continue=True,
+    ):
         self.timer.stop()
         self.current_tracking_number = None
         self.start_time = None
@@ -861,9 +1079,14 @@ class RecorderApp(QWidget):
         self.set_state("已停止")
         self.update_info()
         next_tracking_number = self.pending_tracking_number or requested_next_tracking_number
-        self.pending_tracking_number = None
-        if next_tracking_number:
-            QTimer.singleShot(0, lambda: self.start_recording(next_tracking_number))
+        self.set_pending_tracking(None)
+        if self.exit_after_finalize:
+            self.exit_after_finalize = False
+            QTimer.singleShot(0, self._shutdown_and_quit)
+            return
+        if allow_continue and next_tracking_number:
+            # 直接消费最新值，避免零延迟回调与下一次扫码交错后恢复旧单号。
+            self.start_recording(next_tracking_number)
 
     def force_stop_recording(self):
         if self.current_tracking_number:
@@ -874,7 +1097,7 @@ class RecorderApp(QWidget):
         if self.current_tracking_number is None:
             return
         if start_new_tracking_number:
-            self.pending_tracking_number = start_new_tracking_number
+            self.set_pending_tracking(start_new_tracking_number)
         if self.recording_phase == "starting":
             self.stop_requested = True
             self.log("OBS 尚在确认启动，确认录制后再切换单号")
@@ -925,59 +1148,98 @@ class RecorderApp(QWidget):
         current_start_time = self.start_time
 
         def finalize_recording():
+            success = False
+            error_message = ""
+            destination = None
+            end_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            duration = None
+            if current_start_time:
+                try:
+                    t1 = time.mktime(time.strptime(current_start_time, "%Y-%m-%d %H:%M:%S"))
+                    t2 = time.mktime(time.strptime(end_time, "%Y-%m-%d %H:%M:%S"))
+                    duration = int(t2 - t1)
+                except Exception:
+                    pass
+
             try:
-                if output_path:
-                    _, ext = os.path.splitext(output_path)
-                    if not ext:
-                        ext = ".mkv"
+                video_settings = client.get_video_settings()
+                resolution = f"{video_settings.base_width}x{video_settings.base_height}"
+                fps = (
+                    video_settings.fpsNumerator // video_settings.fpsDenominator
+                    if video_settings.fpsDenominator else 0
+                )
+            except Exception:
+                resolution, fps = "-", 0
 
-                    # 按日期目录保存
-                    today_str = time.strftime("%Y-%m-%d")
-                    date_dir = os.path.join(RECORD_PATH, today_str)
-                    os.makedirs(date_dir, exist_ok=True)
+            try:
+                if not output_path:
+                    raise RuntimeError("OBS 未返回输出文件路径")
 
-                    filename = f"{current_tracking_number}{ext}"
-                    dst = unique_filename(date_dir, filename)
-                    src = output_path
+                extension = os.path.splitext(output_path)[1] or ".mkv"
+                date_dir = os.path.join(RECORD_PATH, end_time[:10])
+                os.makedirs(date_dir, exist_ok=True)
+                filename = f"{sanitize_tracking_filename(current_tracking_number)}{extension}"
+                destination = unique_filename(date_dir, filename)
+                ensure_copy_space(output_path, date_dir, DISK_COPY_RESERVE_GB)
+                move_recording_file(output_path, destination)
+                self.worker_log.emit(f"录制完成：{destination}")
 
-                    try:
-                        move_recording_file(src, dst)
-                        self.worker_log.emit(f"录制完成：{dst}")
-                    except Exception as exc:
-                        self.worker_log.emit(f"录制完成，但无法移动文件：{output_path} ({exc})")
-                        return
-
-                    # 数据库写入
-                    end_time = time.strftime("%Y-%m-%d %H:%M:%S")
-                    duration = None
-                    if current_start_time:
-                        try:
-                            t1 = time.mktime(time.strptime(current_start_time, "%Y-%m-%d %H:%M:%S"))
-                            t2 = time.mktime(time.strptime(end_time, "%Y-%m-%d %H:%M:%S"))
-                            duration = int(t2 - t1)
-                        except Exception:
-                            pass
-
-                    file_size = os.path.getsize(dst) if os.path.exists(dst) else 0
-                    try:
-                        vs = client.get_video_settings()
-                        resolution = f"{vs.base_width}x{vs.base_height}"
-                        fps = vs.fpsNumerator // vs.fpsDenominator if vs.fpsDenominator else 0
-                    except Exception:
-                        resolution, fps = "-", 0
-
-                    db.insert_record(
-                        current_tracking_number, current_start_time, end_time, duration,
-                        dst, file_size, resolution, fps
+                file_size = os.path.getsize(destination)
+                db.insert_record(
+                    current_tracking_number,
+                    current_start_time,
+                    end_time,
+                    duration,
+                    destination,
+                    file_size,
+                    resolution,
+                    fps,
+                )
+                success = True
+                self.worker_log.emit(f"JSONL 已记录单号：{current_tracking_number}")
+            except Exception as exc:
+                error_message = str(exc)
+                failed_jobs.add(
+                    self._failed_job_payload(
+                        current_tracking_number,
+                        output_path,
+                        current_start_time,
+                        end_time,
+                        duration,
+                        resolution,
+                        fps,
+                        exc,
+                        destination if destination and os.path.isfile(destination) else None,
                     )
-                    self.worker_log.emit(f"JSON 已记录单号：{current_tracking_number}")
+                )
+                self.worker_log.emit(
+                    f"录制文件未能归档，已加入恢复任务：{current_tracking_number} ({exc})"
+                )
 
             finally:
-                self.recording_finalized.emit(start_new_tracking_number)
+                self.recording_finalized.emit(
+                    start_new_tracking_number,
+                    success,
+                    error_message,
+                )
 
         threading.Thread(target=finalize_recording, daemon=True).start()
 
-    def _on_recording_finalized(self, requested_next_tracking_number):
+    def _on_recording_finalized(self, requested_next_tracking_number, success, error_message):
+        self.update_failed_jobs_status()
+        if self.exit_after_finalize:
+            self.exit_after_finalize = False
+            self._reset_recording_state_and_continue(allow_continue=False)
+            if success:
+                self._shutdown_and_quit()
+            else:
+                QMessageBox.critical(
+                    self,
+                    "保存失败，未退出",
+                    f"录像已停止，但文件未成功归档：{error_message}\n\n"
+                    "程序将保持打开，请点击“重试保存失败任务”。",
+                )
+            return
         self._reset_recording_state_and_continue(requested_next_tracking_number)
 
     def poll_obs_status(self):
@@ -993,7 +1255,8 @@ class RecorderApp(QWidget):
         except Exception as e:
             self.mark_obs_disconnected(e)
 
-    def closeEvent(self, event):
+    def _shutdown_and_quit(self):
+        self.force_closing = True
         self.reconnect_timer.stop()
         self.window_arrange_timer.stop()
         self.poll_timer.stop()
@@ -1002,13 +1265,62 @@ class RecorderApp(QWidget):
         self.display_window.hide()
         self._disconnect_client(self.event_client)
         self._disconnect_client(self.req_client)
-        event.accept()
+        self.hide()
         QApplication.quit()
+
+    def closeEvent(self, event):
+        if self.force_closing:
+            event.accept()
+            return
+
+        if self.orphan_recording_blocked:
+            event.ignore()
+            QMessageBox.warning(
+                self,
+                "OBS 仍在录制",
+                "请先点击“处理 OBS 当前录像”，接管或停止保存后再退出。",
+            )
+            self.resolve_orphan_recording()
+            return
+
+        if self.current_tracking_number is not None or self.recording_phase != "idle":
+            answer = QMessageBox.question(
+                self,
+                "录制尚未结束",
+                "是否停止当前录像、保存完成后再退出？",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            event.ignore()
+            self.exit_after_finalize = True
+            self.set_pending_tracking(None)
+            self.stop_recording()
+            return
+
+        if failed_jobs.count():
+            answer = QMessageBox.question(
+                self,
+                "仍有保存失败任务",
+                "仍有录像文件尚未成功归档，确认退出吗？",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+        event.accept()
+        self._shutdown_and_quit()
 
 
 # ---------------- 主程序 ----------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    if not acquire_single_instance():
+        QMessageBox.warning(None, "程序已运行", "发货视频录制程序已经在运行。")
+        sys.exit(1)
     app_window = RecorderApp()
     app_window.show()
     sys.exit(app.exec())
