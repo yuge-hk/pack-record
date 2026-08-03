@@ -25,6 +25,7 @@ from app_core import (
     move_recording_file,
     sanitize_tracking_filename,
     unique_filename,
+    video_settings_metadata,
 )
 
 # ================= 配置 =================
@@ -1163,11 +1164,7 @@ class RecorderApp(QWidget):
 
             try:
                 video_settings = client.get_video_settings()
-                resolution = f"{video_settings.base_width}x{video_settings.base_height}"
-                fps = (
-                    video_settings.fpsNumerator // video_settings.fpsDenominator
-                    if video_settings.fpsDenominator else 0
-                )
+                resolution, fps = video_settings_metadata(video_settings)
             except Exception:
                 resolution, fps = "-", 0
 

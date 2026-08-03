@@ -14,10 +14,27 @@ from app_core import (
     move_recording_file,
     sanitize_tracking_filename,
     unique_filename,
+    video_settings_metadata,
 )
 
 
 class CoreTests(unittest.TestCase):
+    def test_video_settings_metadata_supports_obsws_snake_case(self):
+        settings = type(
+            "Settings",
+            (),
+            {
+                "base_width": 1280,
+                "base_height": 800,
+                "fps_numerator": 30000,
+                "fps_denominator": 1001,
+            },
+        )()
+        self.assertEqual(
+            video_settings_metadata(settings),
+            ("1280x800", 30000 / 1001),
+        )
+
     def test_scan_handoff_uses_one_latest_value_not_a_queue(self):
         main_path = Path(__file__).resolve().parents[1] / "main.py"
         source = main_path.read_text(encoding="utf-8")

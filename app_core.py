@@ -144,6 +144,31 @@ def ensure_copy_space(source, destination_directory, reserve_gb=1):
         )
 
 
+def video_settings_metadata(settings):
+    """兼容 obsws-python 的 snake_case 和旧式 camelCase 字段。"""
+    base_width = getattr(settings, "base_width", None)
+    base_height = getattr(settings, "base_height", None)
+    numerator = getattr(
+        settings,
+        "fps_numerator",
+        getattr(settings, "fpsNumerator", 0),
+    )
+    denominator = getattr(
+        settings,
+        "fps_denominator",
+        getattr(settings, "fpsDenominator", 0),
+    )
+    resolution = (
+        f"{base_width}x{base_height}"
+        if base_width is not None and base_height is not None
+        else "-"
+    )
+    fps = numerator / denominator if denominator else 0
+    if isinstance(fps, float) and fps.is_integer():
+        fps = int(fps)
+    return resolution, fps
+
+
 def move_recording_file(source, destination, retries=10, retry_delay=0.5):
     """移动 OBS 输出；同盘原子重命名，跨磁盘安全复制后删除源文件。"""
     last_error = None
