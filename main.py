@@ -26,6 +26,9 @@ BASE_DIR = Path(__file__).resolve().parent
 RECORD_PATH = str(BASE_DIR / "recordings")   # 基础目录
 MAX_RECORD_DURATION_MS = 20 * 60 * 1000       # 最长 20 分钟
 DISK_WARN_GB = 40                             # 磁盘小于40GB时变红色
+RECORD_START_CONFIRM_INTERVAL_MS = 100
+RECORD_START_CONFIRM_ATTEMPTS = 50
+DUPLICATE_SCAN_WINDOW_SECONDS = 1.0
 JSON_DIR = BASE_DIR / "records"
 OBS_EXECUTABLE_CANDIDATES = (
     Path(r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"),
@@ -408,8 +411,12 @@ class RecorderApp(QWidget):
         self.current_tracking_number = None
         self.start_time = None
         self.current_scene = "-"
+        self.recording_phase = "idle"
+        self.record_start_check_attempts = 0
         self.pending_tracking_number = None
         self.stop_requested = False
+        self.last_scan_number = None
+        self.last_scan_monotonic = 0.0
         self.req_client = None
         self.event_client = None
         self.connection_in_progress = False
@@ -619,9 +626,8 @@ class RecorderApp(QWidget):
             self.log("OBS WebSocket 已连接")
         self.start_window_arrangement()
         self.poll_obs_status()
-        if self.stop_requested and self.current_tracking_number is not None:
-            self.stop_requested = False
-            QTimer.singleShot(0, self.stop_recording)
+        if self.current_tracking_number is not None:
+            QTimer.singleShot(0, self._resume_recording_after_reconnect)
             return
         if self.pending_tracking_number and self.current_tracking_number is None:
             tracking_number = self.pending_tracking_number
@@ -641,6 +647,33 @@ class RecorderApp(QWidget):
     def _on_obs_scene_changed(self, scene):
         self.current_scene = scene
         self.log(f"[事件] 场景切换到：{scene}")
+
+    def _resume_recording_after_reconnect(self):
+        client = self.req_client
+        if client is None or self.current_tracking_number is None:
+            return
+        try:
+            status = client.get_record_status()
+            is_recording = bool(getattr(status, "output_active", False))
+        except Exception as exc:
+            self.mark_obs_disconnected(exc)
+            return
+
+        if is_recording:
+            self.recording_phase = "recording"
+            if self.start_time is None:
+                self.start_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            if not self.timer.isActive():
+                self.timer.start(MAX_RECORD_DURATION_MS)
+            self.set_state("录制中")
+            if self.stop_requested or self.pending_tracking_number:
+                self.stop_requested = False
+                QTimer.singleShot(0, self.stop_recording)
+            return
+
+        interrupted_tracking_number = self.current_tracking_number
+        self.log(f"OBS 重连后确认未在录制，放弃未完成单号：{interrupted_tracking_number}")
+        self._reset_recording_state_and_continue()
 
     @staticmethod
     def _disconnect_client(client):
@@ -669,6 +702,8 @@ class RecorderApp(QWidget):
         self.req_client = None
         self.connection_in_progress = False
         self.current_scene = "-"
+        if self.current_tracking_number is not None:
+            self.recording_phase = "waiting_reconnect"
         self.windows_arranged = False
         self.start_window_arrangement()
         self.obs_connection_label.setText("OBS 连接：连接已断开，等待重连")
@@ -701,6 +736,19 @@ class RecorderApp(QWidget):
             self.stop_recording()
             return
 
+        scan_time = time.monotonic()
+        if (
+            tracking_number == self.last_scan_number
+            and scan_time - self.last_scan_monotonic <= DUPLICATE_SCAN_WINDOW_SECONDS
+        ):
+            self.log(f"忽略 1 秒内的重复扫码：{tracking_number}")
+            return
+        self.last_scan_number = tracking_number
+        self.last_scan_monotonic = scan_time
+        if tracking_number == self.current_tracking_number:
+            self.log(f"忽略当前单号的重复扫码：{tracking_number}")
+            return
+
         if self.req_client is None:
             self.pending_tracking_number = tracking_number
             if self.current_tracking_number is not None:
@@ -710,12 +758,23 @@ class RecorderApp(QWidget):
                 self.log(f"OBS 暂时离线，已暂存单号：{tracking_number}")
             self.ensure_obs_connection()
             return
-        if self.current_tracking_number is None:
+        if self.recording_phase == "idle" and self.current_tracking_number is None:
             self.start_recording(tracking_number)
+        elif self.recording_phase == "starting":
+            self.pending_tracking_number = tracking_number
+            self.log(f"OBS 正在启动录制，已暂存下一单号：{tracking_number}")
+        elif self.recording_phase in ("stopping", "saving"):
+            self.pending_tracking_number = tracking_number
+            self.log(f"上一单正在保存，已暂存下一单号：{tracking_number}")
         else:
             self.stop_recording(start_new_tracking_number=tracking_number)
 
     def start_recording(self, tracking_number):
+        if self.recording_phase != "idle" or self.current_tracking_number is not None:
+            if tracking_number != self.current_tracking_number:
+                self.pending_tracking_number = tracking_number
+                self.log(f"当前状态暂不能启动，已暂存单号：{tracking_number}")
+            return
         client = self.req_client
         if client is None:
             self.pending_tracking_number = tracking_number
@@ -728,14 +787,83 @@ class RecorderApp(QWidget):
                 return
             client.start_record()
             self.current_tracking_number = tracking_number
-            self.start_time = time.strftime("%Y-%m-%d %H:%M:%S")
-            self.set_state("录制中")
-            self.timer.start(MAX_RECORD_DURATION_MS)
-            self.log(f"开始录制：{tracking_number}")
+            self.start_time = None
+            self.recording_phase = "starting"
+            self.record_start_check_attempts = 0
+            self.set_state("正在启动")
+            self.log(f"已请求开始录制，等待 OBS 确认：{tracking_number}")
+            QTimer.singleShot(
+                RECORD_START_CONFIRM_INTERVAL_MS,
+                self._confirm_recording_started,
+            )
         except Exception as e:
             self.log(f"无法开始录制: {e}")
             self.current_tracking_number = None
-            self.mark_obs_disconnected(e)
+            self.start_time = None
+            self.recording_phase = "idle"
+            self.set_state("已停止")
+            try:
+                client.get_record_status()
+            except Exception:
+                self.mark_obs_disconnected(e)
+
+    def _confirm_recording_started(self):
+        if self.recording_phase != "starting" or self.current_tracking_number is None:
+            return
+        client = self.req_client
+        if client is None:
+            self.recording_phase = "waiting_reconnect"
+            return
+        try:
+            status = client.get_record_status()
+            is_recording = bool(getattr(status, "output_active", False))
+        except Exception as exc:
+            self.recording_phase = "waiting_reconnect"
+            self.mark_obs_disconnected(exc)
+            return
+
+        if is_recording:
+            self.recording_phase = "recording"
+            self.start_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.set_state("录制中")
+            self.timer.start(MAX_RECORD_DURATION_MS)
+            self.log(f"OBS 已确认开始录制：{self.current_tracking_number}")
+            if self.stop_requested or self.pending_tracking_number:
+                self.stop_requested = False
+                QTimer.singleShot(0, self.stop_recording)
+            return
+
+        self.record_start_check_attempts += 1
+        if self.record_start_check_attempts < RECORD_START_CONFIRM_ATTEMPTS:
+            QTimer.singleShot(
+                RECORD_START_CONFIRM_INTERVAL_MS,
+                self._confirm_recording_started,
+            )
+            return
+
+        failed_tracking_number = self.current_tracking_number
+        confirmation_seconds = (
+            RECORD_START_CONFIRM_INTERVAL_MS * RECORD_START_CONFIRM_ATTEMPTS / 1000
+        )
+        self.log(
+            f"OBS 在 {confirmation_seconds:g} 秒内未进入录制状态，"
+            f"取消单号：{failed_tracking_number}"
+        )
+        self._reset_recording_state_and_continue()
+
+    def _reset_recording_state_and_continue(self, requested_next_tracking_number=None):
+        self.timer.stop()
+        self.current_tracking_number = None
+        self.start_time = None
+        self.recording_phase = "idle"
+        self.record_start_check_attempts = 0
+        self.stop_requested = False
+        self.set_state("已停止")
+        self.update_info()
+        next_tracking_number = self.pending_tracking_number or requested_next_tracking_number
+        self.pending_tracking_number = None
+        if next_tracking_number:
+            QTimer.singleShot(0, lambda: self.start_recording(next_tracking_number))
 
     def force_stop_recording(self):
         if self.current_tracking_number:
@@ -743,28 +871,54 @@ class RecorderApp(QWidget):
         self.stop_recording()
 
     def stop_recording(self, start_new_tracking_number=None):
-        self.timer.stop()
         if self.current_tracking_number is None:
             return
         if start_new_tracking_number:
             self.pending_tracking_number = start_new_tracking_number
+        if self.recording_phase == "starting":
+            self.stop_requested = True
+            self.log("OBS 尚在确认启动，确认录制后再切换单号")
+            return
+        if self.recording_phase in ("stopping", "saving"):
+            self.log("当前录制正在停止或保存，下一单号已暂存")
+            return
         client = self.req_client
         if client is None:
             self.stop_requested = True
+            self.recording_phase = "waiting_reconnect"
             self.set_state("等待 OBS 重连")
             self.ensure_obs_connection()
             return
+        if self.recording_phase not in ("recording", "waiting_reconnect"):
+            self.log(f"当前状态无法停止录制：{self.recording_phase}")
+            return
 
+        self.timer.stop()
+        self.recording_phase = "stopping"
         try:
             resp = client.stop_record()
             output_path = getattr(resp, "output_path", None)
             self.log("录制结束，正在保存文件...")
+            self.recording_phase = "saving"
             self.set_state("保存中")
         except Exception as e:
             self.log(f"停止录制失败: {e}")
-            self.stop_requested = True
-            self.set_state("等待 OBS 重连")
-            self.mark_obs_disconnected(e)
+            try:
+                status = client.get_record_status()
+                is_recording = bool(getattr(status, "output_active", False))
+            except Exception:
+                self.stop_requested = True
+                self.recording_phase = "waiting_reconnect"
+                self.set_state("等待 OBS 重连")
+                self.mark_obs_disconnected(e)
+                return
+            if not is_recording:
+                self.log("OBS 实际未在录制，已重置脚本状态")
+                self._reset_recording_state_and_continue(start_new_tracking_number)
+                return
+            self.recording_phase = "recording"
+            self.timer.start(MAX_RECORD_DURATION_MS)
+            self.set_state("录制中")
             return
 
         current_tracking_number = self.current_tracking_number
@@ -824,14 +978,7 @@ class RecorderApp(QWidget):
         threading.Thread(target=finalize_recording, daemon=True).start()
 
     def _on_recording_finalized(self, requested_next_tracking_number):
-        self.current_tracking_number = None
-        self.start_time = None
-        self.set_state("已停止")
-        self.update_info()
-        next_tracking_number = self.pending_tracking_number or requested_next_tracking_number
-        self.pending_tracking_number = None
-        if next_tracking_number:
-            self.start_recording(next_tracking_number)
+        self._reset_recording_state_and_continue(requested_next_tracking_number)
 
     def poll_obs_status(self):
         """轮询兜底，不覆盖事件状态"""
