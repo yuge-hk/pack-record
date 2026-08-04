@@ -34,7 +34,12 @@ from app_core import (
 )
 
 # ================= 配置 =================
-BASE_DIR = Path(__file__).resolve().parent
+APP_VERSION = "1.0.0"
+BASE_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 SETTINGS_PATH = BASE_DIR / "settings.json"
 settings_store = AppSettingsStore(SETTINGS_PATH, BASE_DIR)
 APP_SETTINGS = settings_store.load()
@@ -577,7 +582,7 @@ class RecorderApp(QWidget):
     def __init__(self):
         super().__init__()
         self.settings = dict(APP_SETTINGS)
-        self.setWindowTitle("发货视频录制")
+        self.setWindowTitle(f"发货视频录制 v{APP_VERSION}")
         self.resize(600, 550)
 
         layout = QVBoxLayout()
@@ -2319,6 +2324,8 @@ class RecorderApp(QWidget):
 # ---------------- 主程序 ----------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setApplicationName("ecom-love-obs")
+    app.setApplicationVersion(APP_VERSION)
     if not acquire_single_instance():
         duplicate_dialog = QMessageBox(
             QMessageBox.Warning,

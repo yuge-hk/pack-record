@@ -34,6 +34,13 @@
 
 Linux 旧版本仅保存在 `archive/main_linux.py`，当前不继续开发。
 
+## 独立 EXE
+
+从 Gitea Release 下载 `ecom-love-obs-v1.0.0-windows-x64.zip`，解压到具有写入权限的
+目录后直接运行 `ecom-love-obs.exe`，无需安装 Python。首次启动会在 EXE 同级目录
+创建 `recordings`、`records`、`logs` 等运行目录；请勿直接放入需要管理员权限写入的
+`Program Files`。
+
 ## 安装与运行
 
 ```bash
@@ -96,3 +103,11 @@ Windows 实机/虚拟机联调辅助工具：
 
 - `tests/windows_obs_control.py`：查询、开始或外部停止 OBS 录像。
 - `tests/windows_gui_scenario.ps1`：执行快速扫码、重复扫码、STOPSTOP、中文输入法和压力场景。
+
+Windows 独立 EXE 构建：
+
+```powershell
+.\build-windows.ps1
+```
+
+构建产物位于 `dist\ecom-love-obs.exe`，文件版本与产品版本均为 `1.0.0`。

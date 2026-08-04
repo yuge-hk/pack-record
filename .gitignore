@@ -16,6 +16,9 @@ settings.json.corrupt-*
 
 # Packaging and test caches
 build/
+!build/
+build/*
+!build/windows_version_info.txt
 dist/
 *.egg-info/
 .pytest_cache/

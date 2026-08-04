@@ -25,8 +25,10 @@ function Activate-Recorder {
     $shell = New-Object -ComObject WScript.Shell
     $targets = Get-CimInstance Win32_Process | Where-Object {
         $_.SessionId -eq 1 -and
-        $_.Name -eq "pythonw.exe" -and
-        $_.CommandLine -match "main.py"
+        (
+            ($_.Name -eq "pythonw.exe" -and $_.CommandLine -match "main.py") -or
+            $_.Name -eq "ecom-love-obs.exe"
+        )
     }
     foreach ($target in $targets) {
         if ($shell.AppActivate([int]$target.ProcessId)) {
