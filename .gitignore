@@ -11,6 +11,8 @@ records/
 sql/
 logs/
 *.log
+settings.json
+settings.json.corrupt-*
 
 # Packaging and test caches
 build/

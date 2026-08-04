@@ -14,12 +14,14 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit,
     QLabel, QTextEdit, QPushButton, QCheckBox, QHBoxLayout,
-    QMessageBox, QInputDialog
+    QMessageBox, QInputDialog, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QTabWidget, QSpinBox, QDoubleSpinBox
 )
 from PySide6.QtCore import QAbstractNativeEventFilter, QTimer, Qt, Signal, QEvent
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 import obsws_python as obs
 from app_core import (
+    AppSettingsStore,
     FailedJobStore,
     VideoDB,
     ensure_copy_space,
@@ -32,20 +34,42 @@ from app_core import (
 )
 
 # ================= 配置 =================
-OBS_WS_HOST = "localhost"
-OBS_WS_PORT = 4455
-OBS_WS_PASSWORD = "83vMnnkOgq0nHu6l"
 BASE_DIR = Path(__file__).resolve().parent
-RECORD_PATH = str(BASE_DIR / "recordings")   # 基础目录
-MAX_RECORD_DURATION_MS = 20 * 60 * 1000       # 最长 20 分钟
-DISK_WARN_GB = 40                             # 磁盘小于40GB时变红色
-DISK_CRITICAL_GB = 10                         # 磁盘小于10GB时禁止新录制
-DISK_COPY_RESERVE_GB = 1                      # 跨盘保存时额外预留1GB
+SETTINGS_PATH = BASE_DIR / "settings.json"
+settings_store = AppSettingsStore(SETTINGS_PATH, BASE_DIR)
+APP_SETTINGS = settings_store.load()
+
+
+def apply_module_settings(settings):
+    """更新工作线程使用的只读配置快照。"""
+    global OBS_WS_HOST, OBS_WS_PORT, OBS_WS_PASSWORD, OBS_EXECUTABLE_PATH
+    global RECORD_PATH, MAX_RECORD_DURATION_MS, DISK_WARN_GB, DISK_CRITICAL_GB
+    global DISK_COPY_RESERVE_GB, RECORD_START_CONFIRM_ATTEMPTS
+    global RECORD_STOP_RETRY_ATTEMPTS, DUPLICATE_SCAN_WINDOW_SECONDS
+    global AUTO_LAUNCH_OBS, AUTO_ARRANGE_WINDOWS, FORCE_ENGLISH_INPUT
+    OBS_WS_HOST = settings["obs_ws_host"]
+    OBS_WS_PORT = settings["obs_ws_port"]
+    OBS_WS_PASSWORD = settings["obs_ws_password"]
+    OBS_EXECUTABLE_PATH = settings["obs_executable"]
+    RECORD_PATH = settings["record_path"]
+    MAX_RECORD_DURATION_MS = settings["max_record_minutes"] * 60 * 1000
+    DISK_WARN_GB = settings["disk_warn_gb"]
+    DISK_CRITICAL_GB = settings["disk_critical_gb"]
+    DISK_COPY_RESERVE_GB = settings["disk_copy_reserve_gb"]
+    RECORD_START_CONFIRM_ATTEMPTS = max(
+        1,
+        round(settings["start_confirm_timeout_seconds"] * 1000 / 100),
+    )
+    RECORD_STOP_RETRY_ATTEMPTS = settings["stop_retry_count"]
+    DUPLICATE_SCAN_WINDOW_SECONDS = settings["duplicate_scan_seconds"]
+    AUTO_LAUNCH_OBS = settings["auto_launch_obs"]
+    AUTO_ARRANGE_WINDOWS = settings["auto_arrange_windows"]
+    FORCE_ENGLISH_INPUT = settings["force_english_input"]
+
+
+apply_module_settings(APP_SETTINGS)
 RECORD_START_CONFIRM_INTERVAL_MS = 100
-RECORD_START_CONFIRM_ATTEMPTS = 50
 RECORD_STOP_RETRY_INTERVAL_MS = 500
-RECORD_STOP_RETRY_ATTEMPTS = 3
-DUPLICATE_SCAN_WINDOW_SECONDS = 1.0
 JSON_DIR = BASE_DIR / "records"
 LOG_DIR = BASE_DIR / "logs"
 FAILED_JOBS_PATH = JSON_DIR / "failed_jobs.json"
@@ -74,6 +98,10 @@ if not logger.handlers:
 
 def find_obs_executable():
     """查找 Windows 上的 OBS 主程序，不依赖额外配置。"""
+    if OBS_EXECUTABLE_PATH:
+        configured = Path(OBS_EXECUTABLE_PATH)
+        if configured.is_file():
+            return configured
     executable_on_path = shutil.which("obs64.exe")
     if executable_on_path:
         return Path(executable_on_path)
@@ -367,6 +395,176 @@ class OBSDisplayWindow(QWidget):
         self.hide_requested.emit()
 
 
+class SettingsDialog(QDialog):
+    """面向操作员的配置面板，不暴露录像一致性与恢复安全规则。"""
+
+    def __init__(self, values, defaults, parent=None):
+        super().__init__(parent)
+        self.defaults = defaults
+        self.setWindowTitle("设置")
+        self.resize(560, 440)
+        root = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
+
+        general_tab = QWidget()
+        general_form = QFormLayout(general_tab)
+        record_path_row = QHBoxLayout()
+        self.record_path = QLineEdit()
+        record_path_row.addWidget(self.record_path)
+        browse_record = QPushButton("浏览…")
+        browse_record.clicked.connect(self._browse_record_path)
+        record_path_row.addWidget(browse_record)
+        general_form.addRow("录像归档目录", record_path_row)
+        self.max_record_minutes = QSpinBox()
+        self.max_record_minutes.setRange(1, 1440)
+        self.max_record_minutes.setSuffix(" 分钟")
+        general_form.addRow("单段最长录像", self.max_record_minutes)
+        self.show_obs_info = QCheckBox("启动时显示 OBS 信息窗口")
+        general_form.addRow("信息窗口", self.show_obs_info)
+        self.auto_launch_obs = QCheckBox("程序启动时自动打开 OBS")
+        general_form.addRow("自动启动", self.auto_launch_obs)
+        self.auto_arrange_windows = QCheckBox("控制程序与 OBS 自动左右排列")
+        general_form.addRow("窗口排列", self.auto_arrange_windows)
+        self.force_english_input = QCheckBox("扫码框聚焦时锁定英文键盘布局")
+        general_form.addRow("扫码输入法", self.force_english_input)
+        self.tabs.addTab(general_tab, "常规")
+
+        obs_tab = QWidget()
+        obs_form = QFormLayout(obs_tab)
+        executable_row = QHBoxLayout()
+        self.obs_executable = QLineEdit()
+        self.obs_executable.setPlaceholderText("留空则自动查找 OBS")
+        executable_row.addWidget(self.obs_executable)
+        browse_obs = QPushButton("浏览…")
+        browse_obs.clicked.connect(self._browse_obs_executable)
+        executable_row.addWidget(browse_obs)
+        obs_form.addRow("OBS 主程序", executable_row)
+        self.obs_ws_host = QLineEdit()
+        obs_form.addRow("WebSocket 地址", self.obs_ws_host)
+        self.obs_ws_port = QSpinBox()
+        self.obs_ws_port.setRange(1, 65535)
+        obs_form.addRow("WebSocket 端口", self.obs_ws_port)
+        self.obs_ws_password = QLineEdit()
+        self.obs_ws_password.setEchoMode(QLineEdit.Password)
+        obs_form.addRow("WebSocket 密码", self.obs_ws_password)
+        note = QLabel("OBS 连接参数以明文保存在项目本机的 settings.json 中。")
+        note.setWordWrap(True)
+        obs_form.addRow("", note)
+        self.tabs.addTab(obs_tab, "OBS")
+
+        storage_tab = QWidget()
+        storage_form = QFormLayout(storage_tab)
+        self.disk_warn_gb = QSpinBox()
+        self.disk_warn_gb.setRange(1, 100000)
+        self.disk_warn_gb.setSuffix(" GB")
+        storage_form.addRow("剩余空间警告", self.disk_warn_gb)
+        self.disk_critical_gb = QSpinBox()
+        self.disk_critical_gb.setRange(1, 100000)
+        self.disk_critical_gb.setSuffix(" GB")
+        storage_form.addRow("禁止新录像阈值", self.disk_critical_gb)
+        self.disk_copy_reserve_gb = QSpinBox()
+        self.disk_copy_reserve_gb.setRange(0, 10000)
+        self.disk_copy_reserve_gb.setSuffix(" GB")
+        storage_form.addRow("跨盘复制额外预留", self.disk_copy_reserve_gb)
+        self.duplicate_scan_seconds = QDoubleSpinBox()
+        self.duplicate_scan_seconds.setRange(0.0, 10.0)
+        self.duplicate_scan_seconds.setDecimals(1)
+        self.duplicate_scan_seconds.setSingleStep(0.1)
+        self.duplicate_scan_seconds.setSuffix(" 秒")
+        storage_form.addRow("同单号防重复窗口", self.duplicate_scan_seconds)
+        self.tabs.addTab(storage_tab, "扫码与存储")
+
+        advanced_tab = QWidget()
+        advanced_form = QFormLayout(advanced_tab)
+        self.start_confirm_timeout_seconds = QDoubleSpinBox()
+        self.start_confirm_timeout_seconds.setRange(1.0, 60.0)
+        self.start_confirm_timeout_seconds.setDecimals(1)
+        self.start_confirm_timeout_seconds.setSuffix(" 秒")
+        advanced_form.addRow("开始录像确认超时", self.start_confirm_timeout_seconds)
+        self.stop_retry_count = QSpinBox()
+        self.stop_retry_count.setRange(1, 20)
+        advanced_form.addRow("停止录像重试次数", self.stop_retry_count)
+        warning = QLabel(
+            "高级参数通常无需修改。恢复事务、文件完整性检查、最新扫码覆盖策略"
+            "等安全规则为固定行为。"
+        )
+        warning.setWordWrap(True)
+        advanced_form.addRow("", warning)
+        self.tabs.addTab(advanced_tab, "高级")
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save
+            | QDialogButtonBox.Cancel
+            | QDialogButtonBox.RestoreDefaults
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(
+            lambda: self.set_values(self.defaults)
+        )
+        root.addWidget(buttons)
+        self.set_values(values)
+
+    def _browse_record_path(self):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "选择录像归档目录",
+            self.record_path.text(),
+        )
+        if path:
+            self.record_path.setText(path)
+
+    def _browse_obs_executable(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 OBS 主程序",
+            self.obs_executable.text(),
+            "OBS (obs64.exe);;可执行文件 (*.exe);;所有文件 (*)",
+        )
+        if path:
+            self.obs_executable.setText(path)
+
+    def set_values(self, values):
+        for key in (
+            "record_path", "obs_executable", "obs_ws_host", "obs_ws_password"
+        ):
+            getattr(self, key).setText(str(values[key]))
+        for key in (
+            "obs_ws_port", "max_record_minutes", "disk_warn_gb",
+            "disk_critical_gb", "disk_copy_reserve_gb", "stop_retry_count",
+        ):
+            getattr(self, key).setValue(int(values[key]))
+        for key in ("duplicate_scan_seconds", "start_confirm_timeout_seconds"):
+            getattr(self, key).setValue(float(values[key]))
+        for key in (
+            "show_obs_info", "auto_launch_obs", "auto_arrange_windows",
+            "force_english_input",
+        ):
+            getattr(self, key).setChecked(bool(values[key]))
+
+    def values(self):
+        return {
+            "schema_version": AppSettingsStore.SCHEMA_VERSION,
+            "record_path": self.record_path.text(),
+            "obs_executable": self.obs_executable.text(),
+            "obs_ws_host": self.obs_ws_host.text(),
+            "obs_ws_port": self.obs_ws_port.value(),
+            "obs_ws_password": self.obs_ws_password.text(),
+            "max_record_minutes": self.max_record_minutes.value(),
+            "disk_warn_gb": self.disk_warn_gb.value(),
+            "disk_critical_gb": self.disk_critical_gb.value(),
+            "disk_copy_reserve_gb": self.disk_copy_reserve_gb.value(),
+            "duplicate_scan_seconds": self.duplicate_scan_seconds.value(),
+            "start_confirm_timeout_seconds": self.start_confirm_timeout_seconds.value(),
+            "stop_retry_count": self.stop_retry_count.value(),
+            "show_obs_info": self.show_obs_info.isChecked(),
+            "auto_launch_obs": self.auto_launch_obs.isChecked(),
+            "auto_arrange_windows": self.auto_arrange_windows.isChecked(),
+            "force_english_input": self.force_english_input.isChecked(),
+        }
+
+
 class RecorderApp(QWidget):
     obs_connection_ready = Signal(object, object, str)
     obs_connection_failed = Signal(str)
@@ -378,6 +576,7 @@ class RecorderApp(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.settings = dict(APP_SETTINGS)
         self.setWindowTitle("发货视频录制")
         self.resize(600, 550)
 
@@ -388,6 +587,7 @@ class RecorderApp(QWidget):
         layout.addWidget(self.label)
 
         self.input = QLineEdit()
+        self.input_ime_context = None
         self.input.setAttribute(Qt.WA_InputMethodEnabled, False)
         self.input.setInputMethodHints(Qt.ImhNoPredictiveText)
         self.input.returnPressed.connect(self.handle_input)
@@ -402,7 +602,7 @@ class RecorderApp(QWidget):
         layout.addWidget(self.stop_button)
 
         self.display_checkbox = QCheckBox("显示 OBS 信息窗口")
-        self.display_checkbox.setChecked(False)
+        self.display_checkbox.setChecked(self.settings["show_obs_info"])
         layout.addWidget(self.display_checkbox)
 
         # ===== 信息区 =====
@@ -442,6 +642,12 @@ class RecorderApp(QWidget):
         self.resolve_orphan_button.clicked.connect(self.resolve_orphan_recording)
         self.resolve_orphan_button.hide()
         recovery_buttons.addWidget(self.resolve_orphan_button)
+        recovery_buttons.addStretch(1)
+        self.settings_button = QPushButton("设置")
+        self.settings_button.clicked.connect(self.open_settings)
+        recovery_buttons.addWidget(self.settings_button)
+        self.settings_shortcut = QShortcut(QKeySequence("Ctrl+,"), self)
+        self.settings_shortcut.activated.connect(self.open_settings)
         layout.addLayout(recovery_buttons)
 
         # ===== 日志区 =====
@@ -479,7 +685,8 @@ class RecorderApp(QWidget):
         self.keyboard_layout_timer.timeout.connect(
             self._force_windows_english_keyboard_layout
         )
-        self.keyboard_layout_timer.start()
+        if FORCE_ENGLISH_INPUT:
+            self.keyboard_layout_timer.start()
 
         # 状态变量
         self.current_tracking_number = None
@@ -536,6 +743,7 @@ class RecorderApp(QWidget):
         self.display_window.hide_requested.connect(
             lambda: self.display_checkbox.setChecked(False)
         )
+        self.display_window.setVisible(self.display_checkbox.isChecked())
 
         self.obs_connection_ready.connect(self._on_obs_connection_ready)
         self.obs_connection_failed.connect(self._on_obs_connection_failed)
@@ -550,6 +758,8 @@ class RecorderApp(QWidget):
         )
         QApplication.instance().installNativeEventFilter(self.native_enter_filter)
         self.update_failed_jobs_status()
+        for warning in settings_store.consume_warnings():
+            self.log(f"⚠️ {warning}")
         QTimer.singleShot(0, self.ensure_obs_connection)
         QTimer.singleShot(0, self.launch_obs_and_prepare_windows)
         QTimer.singleShot(100, self.focus_scan_input)
@@ -563,6 +773,87 @@ class RecorderApp(QWidget):
         print(line)
         logger.info(msg)
         self.update_info()
+
+    def open_settings(self):
+        dialog = SettingsDialog(
+            self.settings,
+            settings_store.defaults(),
+            self,
+        )
+        while dialog.exec() == QDialog.Accepted:
+            proposed = dialog.values()
+            connection_keys = {
+                "obs_ws_host", "obs_ws_port", "obs_ws_password"
+            }
+            idle_required_keys = connection_keys | {"record_path"}
+            changed_idle_keys = {
+                key for key in idle_required_keys
+                if proposed.get(key) != self.settings.get(key)
+            }
+            if changed_idle_keys and (
+                self.current_tracking_number is not None
+                or self.recording_phase != "idle"
+                or self.retry_in_progress
+            ):
+                QMessageBox.warning(
+                    self,
+                    "当前无法应用",
+                    "修改录像目录或 OBS 连接参数前，请先停止录像并等待保存完成。",
+                )
+                continue
+            if changed_idle_keys & connection_keys and self.connection_in_progress:
+                QMessageBox.warning(
+                    self,
+                    "OBS 正在连接",
+                    "请等待本次 OBS 连接完成后再修改连接参数。",
+                )
+                continue
+            try:
+                validated = settings_store.validate(proposed)
+                Path(validated["record_path"]).mkdir(parents=True, exist_ok=True)
+                saved = settings_store.save(validated)
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "设置无法保存", str(exc))
+                continue
+            previous = self.settings
+            self.settings = saved
+            APP_SETTINGS.clear()
+            APP_SETTINGS.update(saved)
+            apply_module_settings(saved)
+            self._apply_runtime_settings(previous)
+            self.log("设置已保存并应用")
+            break
+
+    def _apply_runtime_settings(self, previous):
+        self.display_checkbox.setChecked(self.settings["show_obs_info"])
+        if FORCE_ENGLISH_INPUT:
+            if not self.keyboard_layout_timer.isActive():
+                self.keyboard_layout_timer.start()
+            self._disable_windows_ime()
+        else:
+            self.keyboard_layout_timer.stop()
+
+        connection_changed = any(
+            previous.get(key) != self.settings.get(key)
+            for key in ("obs_ws_host", "obs_ws_port", "obs_ws_password")
+        )
+        if connection_changed:
+            with self.obs_request_lock:
+                self._disconnect_client(self.event_client)
+                self._disconnect_client(self.req_client)
+                self.event_client = None
+                self.req_client = None
+            self.connection_in_progress = False
+            QTimer.singleShot(0, self.ensure_obs_connection)
+
+        if AUTO_ARRANGE_WINDOWS and not self.windows_arranged:
+            self.start_window_arrangement()
+        elif not AUTO_ARRANGE_WINDOWS:
+            self.window_arrange_timer.stop()
+        if AUTO_LAUNCH_OBS and sys.platform == "win32" and not get_obs_process_ids():
+            QTimer.singleShot(0, self.launch_obs_and_prepare_windows)
+        self.update_disk_space()
+        self.focus_scan_input()
 
     def _clear_scanner_buffer(self):
         self.scanner_buffer = ""
@@ -606,6 +897,26 @@ class RecorderApp(QWidget):
 
     def _disable_windows_ime(self):
         """扫码输入框始终使用直接键盘输入，避免中文输入法接管回车。"""
+        if not FORCE_ENGLISH_INPUT:
+            self.input.setAttribute(Qt.WA_InputMethodEnabled, True)
+            if sys.platform == "win32" and self.input_ime_context:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    imm32 = ctypes.windll.imm32
+                    imm32.ImmAssociateContext.argtypes = [
+                        wintypes.HWND,
+                        wintypes.HANDLE,
+                    ]
+                    imm32.ImmAssociateContext(
+                        int(self.input.winId()),
+                        self.input_ime_context,
+                    )
+                    self.input_ime_context = None
+                except Exception as exc:
+                    logger.warning("无法恢复扫码输入框 IME：%s", exc)
+            return
         self.input.setAttribute(Qt.WA_InputMethodEnabled, False)
         if sys.platform != "win32":
             return
@@ -619,14 +930,23 @@ class RecorderApp(QWidget):
                 wintypes.HANDLE,
             ]
             imm32.ImmAssociateContext.restype = wintypes.HANDLE
-            imm32.ImmAssociateContext(int(self.input.winId()), None)
+            previous_context = imm32.ImmAssociateContext(
+                int(self.input.winId()),
+                None,
+            )
+            if self.input_ime_context is None and previous_context:
+                self.input_ime_context = previous_context
             self._force_windows_english_keyboard_layout()
         except Exception as exc:
             logger.warning("无法禁用扫码输入框 IME：%s", exc)
 
     def _force_windows_english_keyboard_layout(self):
         """扫码框聚焦时锁定英文键盘布局，防止数字成为中文候选键。"""
-        if sys.platform != "win32" or not self.input.hasFocus():
+        if (
+            not FORCE_ENGLISH_INPUT
+            or sys.platform != "win32"
+            or not self.input.hasFocus()
+        ):
             return
         try:
             import ctypes
@@ -1053,7 +1373,7 @@ class RecorderApp(QWidget):
             self.focus_scan_input()
             return
 
-        if not get_obs_process_ids():
+        if AUTO_LAUNCH_OBS and not get_obs_process_ids():
             executable = find_obs_executable()
             if executable is None:
                 self.log("未找到 OBS 安装目录，请手动启动 OBS；连接恢复后会继续运行")
@@ -1068,10 +1388,13 @@ class RecorderApp(QWidget):
                     self.log(f"已启动 OBS：{executable}")
                 except OSError as exc:
                     self.log(f"无法启动 OBS，请手动打开：{exc}")
-        self.start_window_arrangement()
+        if AUTO_ARRANGE_WINDOWS:
+            self.start_window_arrangement()
+        else:
+            self.focus_scan_input()
 
     def start_window_arrangement(self):
-        if sys.platform != "win32" or self.windows_arranged:
+        if not AUTO_ARRANGE_WINDOWS or sys.platform != "win32" or self.windows_arranged:
             return
         self.window_arrange_attempts = 0
         if not self.window_arrange_timer.isActive():
@@ -1079,7 +1402,7 @@ class RecorderApp(QWidget):
         self._try_arrange_windows()
 
     def _try_arrange_windows(self):
-        if sys.platform != "win32":
+        if not AUTO_ARRANGE_WINDOWS or sys.platform != "win32":
             self.window_arrange_timer.stop()
             return
 

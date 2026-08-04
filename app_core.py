@@ -13,6 +13,133 @@ from datetime import datetime
 from pathlib import Path
 
 
+class AppSettingsStore:
+    """加载并原子保存用户配置；缺失字段自动采用当前版本默认值。"""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path, base_dir):
+        self.path = Path(path)
+        self.base_dir = Path(base_dir)
+        self.warnings = []
+
+    def defaults(self):
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "record_path": str(self.base_dir / "recordings"),
+            "obs_executable": "",
+            "obs_ws_host": "localhost",
+            "obs_ws_port": 4455,
+            "obs_ws_password": "83vMnnkOgq0nHu6l",
+            "max_record_minutes": 20,
+            "disk_warn_gb": 40,
+            "disk_critical_gb": 10,
+            "disk_copy_reserve_gb": 1,
+            "duplicate_scan_seconds": 1.0,
+            "start_confirm_timeout_seconds": 5.0,
+            "stop_retry_count": 3,
+            "show_obs_info": False,
+            "auto_launch_obs": True,
+            "auto_arrange_windows": True,
+            "force_english_input": True,
+        }
+
+    def validate(self, values):
+        if not isinstance(values, dict):
+            raise ValueError("设置文件根节点必须是 JSON 对象")
+        result = self.defaults()
+        result.update({key: values[key] for key in result if key in values})
+        result["schema_version"] = self.SCHEMA_VERSION
+
+        result["record_path"] = str(result["record_path"]).strip()
+        if not result["record_path"]:
+            raise ValueError("录像归档目录不能为空")
+        record_path = Path(result["record_path"])
+        if not record_path.is_absolute():
+            record_path = self.base_dir / record_path
+        result["record_path"] = str(record_path.resolve())
+
+        result["obs_executable"] = str(result["obs_executable"]).strip()
+        result["obs_ws_host"] = str(result["obs_ws_host"]).strip()
+        result["obs_ws_password"] = str(result["obs_ws_password"])
+        if not result["obs_ws_host"]:
+            raise ValueError("OBS WebSocket 地址不能为空")
+
+        integer_ranges = {
+            "obs_ws_port": (1, 65535),
+            "max_record_minutes": (1, 24 * 60),
+            "disk_warn_gb": (1, 100000),
+            "disk_critical_gb": (1, 100000),
+            "disk_copy_reserve_gb": (0, 10000),
+            "stop_retry_count": (1, 20),
+        }
+        for key, (minimum, maximum) in integer_ranges.items():
+            try:
+                result[key] = int(result[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"设置 {key} 必须是整数") from exc
+            if not minimum <= result[key] <= maximum:
+                raise ValueError(f"设置 {key} 必须介于 {minimum} 和 {maximum} 之间")
+
+        float_ranges = {
+            "duplicate_scan_seconds": (0.0, 10.0),
+            "start_confirm_timeout_seconds": (1.0, 60.0),
+        }
+        for key, (minimum, maximum) in float_ranges.items():
+            try:
+                result[key] = float(result[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"设置 {key} 必须是数字") from exc
+            if not minimum <= result[key] <= maximum:
+                raise ValueError(f"设置 {key} 必须介于 {minimum:g} 和 {maximum:g} 之间")
+
+        if result["disk_critical_gb"] >= result["disk_warn_gb"]:
+            raise ValueError("磁盘禁止阈值必须小于警告阈值")
+
+        for key in (
+            "show_obs_info",
+            "auto_launch_obs",
+            "auto_arrange_windows",
+            "force_english_input",
+        ):
+            if not isinstance(result[key], bool):
+                raise ValueError(f"设置 {key} 必须是布尔值")
+        return result
+
+    def load(self):
+        if not self.path.exists():
+            return self.defaults()
+        try:
+            values = json.loads(self.path.read_text(encoding="utf-8"))
+            return self.validate(values)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            backup_path = self.path.with_name(f"{self.path.name}.corrupt-{timestamp}")
+            try:
+                os.replace(self.path, backup_path)
+                self.warnings.append(f"设置文件无效，已备份到 {backup_path}：{exc}")
+            except OSError as backup_error:
+                self.warnings.append(f"设置文件无效且无法备份：{backup_error}")
+            return self.defaults()
+
+    def save(self, values):
+        result = self.validate(values)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        with temporary_path.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(result, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, self.path)
+        return result
+
+    def consume_warnings(self):
+        warnings = list(self.warnings)
+        self.warnings.clear()
+        return warnings
+
+
 class VideoDB:
     """以 JSONL 按日追加录制记录，避免记录量增长导致整文件重写。"""
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app_core import (
+    AppSettingsStore,
     FailedJobStore,
     VideoDB,
     ensure_copy_space,
@@ -23,6 +24,55 @@ from app_core import (
 
 
 class CoreTests(unittest.TestCase):
+    def test_settings_defaults_round_trip_and_relative_record_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AppSettingsStore(root / "settings.json", root)
+            defaults = store.load()
+            self.assertEqual(defaults["obs_ws_port"], 4455)
+            defaults["record_path"] = "custom-recordings"
+            defaults["max_record_minutes"] = 35
+            saved = store.save(defaults)
+            self.assertEqual(
+                saved["record_path"],
+                str((root / "custom-recordings").resolve()),
+            )
+            self.assertEqual(store.load()["max_record_minutes"], 35)
+
+    def test_settings_reject_invalid_disk_thresholds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AppSettingsStore(root / "settings.json", root)
+            values = store.defaults()
+            values["disk_warn_gb"] = 10
+            values["disk_critical_gb"] = 10
+            with self.assertRaisesRegex(ValueError, "禁止阈值"):
+                store.save(values)
+
+    def test_corrupt_settings_are_backed_up_and_defaults_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text("{broken", encoding="utf-8")
+            store = AppSettingsStore(path, root)
+            loaded = store.load()
+            self.assertEqual(loaded["max_record_minutes"], 20)
+            self.assertFalse(path.exists())
+            self.assertEqual(len(list(root.glob("settings.json.corrupt-*"))), 1)
+            self.assertIn("已备份", store.consume_warnings()[0])
+
+    def test_settings_merge_new_defaults_from_old_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text(
+                json.dumps({"obs_ws_host": "192.168.0.10"}),
+                encoding="utf-8",
+            )
+            loaded = AppSettingsStore(path, root).load()
+            self.assertEqual(loaded["obs_ws_host"], "192.168.0.10")
+            self.assertTrue(loaded["auto_launch_obs"])
+
     def test_video_settings_metadata_supports_obsws_snake_case(self):
         settings = type(
             "Settings",
