@@ -13,6 +13,8 @@ from app_core import (
     FailedJobStore,
     VideoDB,
     ensure_copy_space,
+    is_likely_obs_recording_start_error,
+    is_obs_recording_failure_state,
     move_recording_file,
     release_filename_reservation,
     reserve_unique_filename,
@@ -24,6 +26,31 @@ from app_core import (
 
 
 class CoreTests(unittest.TestCase):
+    def test_obs_failure_state_detection(self):
+        self.assertTrue(
+            is_obs_recording_failure_state("OBS_WEBSOCKET_OUTPUT_START_FAILED")
+        )
+        self.assertTrue(is_obs_recording_failure_state("encoder_error"))
+        self.assertFalse(is_obs_recording_failure_state("OBS_WEBSOCKET_OUTPUT_STOPPED"))
+
+    def test_obs_start_error_detection(self):
+        self.assertTrue(
+            is_likely_obs_recording_start_error(
+                "Request StartRecord returned code 500: Output start failed"
+            )
+        )
+        self.assertTrue(is_likely_obs_recording_start_error("编码器初始化失败"))
+        self.assertFalse(is_likely_obs_recording_start_error("connection timed out"))
+
+    def test_encoder_fault_path_preserves_tracking_and_blocks_scans(self):
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("self.fault_tracking_number = tracking_number", source)
+        self.assertIn("if self.encoder_fault_blocked:", source)
+        self.assertIn("self._enter_encoder_fault(", source)
+        self.assertNotIn("取消单号：{failed_tracking_number}", source)
+
     def test_settings_defaults_round_trip_and_relative_record_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

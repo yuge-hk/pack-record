@@ -13,6 +13,30 @@ from datetime import datetime
 from pathlib import Path
 
 
+def is_obs_recording_failure_state(state):
+    """识别 OBS 输出状态中的明确失败标记。"""
+    normalized = str(state or "").upper()
+    return any(marker in normalized for marker in ("ERROR", "FAILED", "FAILURE"))
+
+
+def is_likely_obs_recording_start_error(message):
+    """判断 StartRecord 异常是否明确指向输出/编码器启动失败。"""
+    normalized = str(message or "").casefold()
+    markers = (
+        "encoder",
+        "encoding",
+        "output start failed",
+        "failed to start",
+        "startrecord returned code 500",
+        "编码器",
+        "编码失败",
+        "无法开始录制",
+        "启动输出失败",
+        "输出启动失败",
+    )
+    return any(marker in normalized for marker in markers)
+
+
 class AppSettingsStore:
     """加载并原子保存用户配置；缺失字段自动采用当前版本默认值。"""
 

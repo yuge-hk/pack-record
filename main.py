@@ -25,6 +25,8 @@ from app_core import (
     FailedJobStore,
     VideoDB,
     ensure_copy_space,
+    is_likely_obs_recording_start_error,
+    is_obs_recording_failure_state,
     move_recording_file,
     release_filename_reservation,
     reserve_unique_filename,
@@ -34,7 +36,7 @@ from app_core import (
 )
 
 # ================= 配置 =================
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 BASE_DIR = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
@@ -249,6 +251,90 @@ def accept_obs_crash_dialog(process_ids):
     user32.PostMessageW(window_handle, 0x0100, 0x0D, 0)  # WM_KEYDOWN / VK_RETURN
     user32.PostMessageW(window_handle, 0x0101, 0x0D, 0)  # WM_KEYUP / VK_RETURN
     return int(window_handle)
+
+
+def find_obs_recording_error_dialog(process_ids):
+    """查找 OBS 的录像输出/编码器错误对话框，不自动关闭。"""
+    if sys.platform != "win32" or not process_ids:
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    matches = []
+    window_callback = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+    child_callback = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.EnumWindows.argtypes = [window_callback, wintypes.LPARAM]
+    user32.EnumChildWindows.argtypes = [
+        wintypes.HWND,
+        child_callback,
+        wintypes.LPARAM,
+    ]
+
+    def window_text(window_handle):
+        length = user32.GetWindowTextLengthW(window_handle)
+        if length <= 0:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(window_handle, buffer, length + 1)
+        return buffer.value.strip()
+
+    @window_callback
+    def enum_window(window_handle, _):
+        if not user32.IsWindowVisible(window_handle):
+            return True
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window_handle, ctypes.byref(process_id))
+        if process_id.value not in process_ids:
+            return True
+
+        texts = [window_text(window_handle)]
+
+        @child_callback
+        def enum_child(child_handle, _child_param):
+            text = window_text(child_handle)
+            if text:
+                texts.append(text)
+            return True
+
+        user32.EnumChildWindows(window_handle, enum_child, 0)
+        combined = " | ".join(text for text in texts if text)
+        normalized = combined.casefold()
+        markers = (
+            "failed to start recording",
+            "starting the output failed",
+            "output start failed",
+            "encoder error",
+            "encoder initialization",
+            "无法开始录制",
+            "启动输出失败",
+            "输出启动失败",
+            "编码器错误",
+            "编码器初始化失败",
+        )
+        if any(marker in normalized for marker in markers):
+            matches.append((int(window_handle), combined[:300]))
+            return False
+        return True
+
+    user32.EnumWindows(enum_window, 0)
+    return matches[0] if matches else None
 
 
 def move_windows_window(window_handle, x, y, width, height):
@@ -639,6 +725,27 @@ class RecorderApp(QWidget):
         self.failed_jobs_label.setStyleSheet("font-size: 14px; color: gray;")
         layout.addWidget(self.failed_jobs_label)
 
+        self.encoder_fault_label = QLabel()
+        self.encoder_fault_label.setWordWrap(True)
+        self.encoder_fault_label.setStyleSheet(
+            "font-size: 15px; color: white; background-color: #b91c1c; "
+            "font-weight: bold; padding: 10px; border-radius: 5px;"
+        )
+        self.encoder_fault_label.hide()
+        layout.addWidget(self.encoder_fault_label)
+
+        fault_buttons = QHBoxLayout()
+        self.retry_fault_button = QPushButton("修复后重试当前单号")
+        self.retry_fault_button.clicked.connect(self.retry_faulted_tracking)
+        self.retry_fault_button.hide()
+        fault_buttons.addWidget(self.retry_fault_button)
+        self.restart_obs_button = QPushButton("重启 OBS")
+        self.restart_obs_button.clicked.connect(self.restart_obs_after_fault)
+        self.restart_obs_button.hide()
+        fault_buttons.addWidget(self.restart_obs_button)
+        fault_buttons.addStretch(1)
+        layout.addLayout(fault_buttons)
+
         recovery_buttons = QHBoxLayout()
         self.retry_failed_button = QPushButton("重试保存失败任务")
         self.retry_failed_button.clicked.connect(self.retry_failed_jobs)
@@ -712,6 +819,10 @@ class RecorderApp(QWidget):
         self.exit_after_finalize = False
         self.force_closing = False
         self.orphan_recording_blocked = False
+        self.encoder_fault_blocked = False
+        self.fault_tracking_number = None
+        self.encoder_fault_reason = None
+        self.fault_after_finalize_reason = None
         self.retry_in_progress = False
         self.last_record_output_path = None
         self.obs_request_lock = threading.RLock()
@@ -724,10 +835,16 @@ class RecorderApp(QWidget):
         self.windows_arranged = False
         self.window_arrange_attempts = 0
         self.last_obs_crash_dialog_handle = None
+        self.last_obs_recording_error_dialog_handle = None
 
         self.window_arrange_timer = QTimer(self)
         self.window_arrange_timer.setInterval(500)
         self.window_arrange_timer.timeout.connect(self._try_arrange_windows)
+
+        self.obs_error_timer = QTimer(self)
+        self.obs_error_timer.setInterval(1500)
+        self.obs_error_timer.timeout.connect(self._check_obs_recording_error_dialog)
+        self.obs_error_timer.start()
 
         self.scanner_buffer_timer = QTimer(self)
         self.scanner_buffer_timer.setSingleShot(True)
@@ -778,6 +895,169 @@ class RecorderApp(QWidget):
         print(line)
         logger.info(msg)
         self.update_info()
+
+    def _enter_encoder_fault(self, reason, tracking_number=None):
+        """锁定扫码并保留未可靠录制的单号，等待人工修复。"""
+        tracking_number = (
+            tracking_number
+            or self.current_tracking_number
+            or self.fault_tracking_number
+        )
+        if self.pending_tracking_number:
+            self.log(
+                f"编码器故障发生，未继续处理待扫描单号：{self.pending_tracking_number}"
+            )
+        self.timer.stop()
+        self.set_pending_tracking(None)
+        self.current_tracking_number = None
+        self.current_recording_id = None
+        self.start_time = None
+        self.recording_started_monotonic = None
+        self.recording_deadline_monotonic = None
+        self.recording_finalization_started = False
+        with self.record_state_lock:
+            self.last_record_output_path = None
+        self.recording_phase = "fault"
+        self.record_start_check_attempts = 0
+        self.record_stop_retry_attempts = 0
+        self.stop_requested = False
+        self.encoder_fault_blocked = True
+        self.fault_tracking_number = tracking_number
+        self.encoder_fault_reason = str(reason or "OBS 录像输出启动失败")
+        self.fault_after_finalize_reason = None
+        self.encoder_fault_label.setText(
+            "OBS 编码器/录像输出故障，扫码已锁定\n"
+            f"待录单号：{tracking_number or '-'}\n"
+            f"原因：{self.encoder_fault_reason[:300]}"
+        )
+        self.encoder_fault_label.show()
+        self.retry_fault_button.setText(
+            f"修复后重试：{tracking_number}" if tracking_number
+            else "修复后解除锁定"
+        )
+        self.retry_fault_button.show()
+        self.restart_obs_button.show()
+        self.set_state("编码器故障，扫码已锁定")
+        self.update_info()
+        QApplication.beep()
+        self.log(
+            "❌ OBS 编码器/录像输出故障，已保留当前单号并禁止后续扫码："
+            f"{self.encoder_fault_reason}"
+        )
+
+    def _clear_encoder_fault(self):
+        self.encoder_fault_blocked = False
+        self.encoder_fault_reason = None
+        self.fault_tracking_number = None
+        self.fault_after_finalize_reason = None
+        self.last_obs_recording_error_dialog_handle = None
+        self.encoder_fault_label.hide()
+        self.retry_fault_button.hide()
+        self.restart_obs_button.setEnabled(True)
+        self.restart_obs_button.hide()
+        self.recording_phase = "idle"
+        self.set_state("已停止")
+        self.update_info()
+
+    def retry_faulted_tracking(self):
+        if not self.encoder_fault_blocked:
+            return
+        tracking_number = self.fault_tracking_number
+        if self.req_client is None:
+            self.log("OBS 尚未重新连接；连接成功后请再次点击重试")
+            self.ensure_obs_connection()
+            return
+        try:
+            status = self._call_obs("get_record_status")
+            if bool(getattr(status, "output_active", False)):
+                QMessageBox.warning(
+                    self,
+                    "OBS 正在录制",
+                    "OBS 当前仍在录制，不能重试故障单号。请先处理当前录像。",
+                )
+                return
+        except Exception as exc:
+            self.log(f"重试前无法确认 OBS 状态：{exc}")
+            self.mark_obs_disconnected(exc)
+            return
+        self._clear_encoder_fault()
+        if tracking_number:
+            self.log(f"正在重试故障单号：{tracking_number}")
+            self.start_recording(tracking_number)
+
+    def restart_obs_after_fault(self):
+        if sys.platform != "win32":
+            self.log("当前平台不支持由程序自动重启 OBS")
+            return
+        answer = QMessageBox.question(
+            self,
+            "重启 OBS",
+            "将强制关闭并重新启动 OBS。确认继续吗？",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.restart_obs_button.setEnabled(False)
+        self.log("正在重启 OBS；故障单号会继续保留")
+        self.window_arrange_timer.stop()
+        self.windows_arranged = False
+        with self.obs_request_lock:
+            self._disconnect_client(self.event_client)
+            self._disconnect_client(self.req_client)
+            self.event_client = None
+            self.req_client = None
+        self.connection_in_progress = False
+        self.obs_connection_label.setText("OBS 连接：正在重启…")
+        try:
+            subprocess.run(
+                ["taskkill", "/IM", "obs64.exe", "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.log(f"关闭 OBS 时出现异常：{exc}")
+        self.obs_process = None
+        QTimer.singleShot(1500, self._finish_obs_restart)
+
+    def _finish_obs_restart(self):
+        self.restart_obs_button.setEnabled(True)
+        self.launch_obs_and_prepare_windows(force_launch=True)
+        self.ensure_obs_connection()
+
+    def _check_obs_recording_error_dialog(self):
+        match = find_obs_recording_error_dialog(get_obs_process_ids())
+        if not match:
+            return
+        window_handle, details = match
+        if window_handle == self.last_obs_recording_error_dialog_handle:
+            return
+        self.last_obs_recording_error_dialog_handle = window_handle
+        reason = f"检测到 OBS 错误窗口：{details or '录像输出/编码器启动失败'}"
+        if self.recording_phase == "starting":
+            self._enter_encoder_fault(reason)
+            return
+        if self.current_tracking_number is not None and self.recording_phase in (
+            "recording", "stopping", "waiting_reconnect", "saving"
+        ):
+            self.fault_after_finalize_reason = reason
+            if self.recording_phase != "saving":
+                try:
+                    status = self._call_obs("get_record_status")
+                    output_active = bool(getattr(status, "output_active", False))
+                    output_path = getattr(status, "output_path", None)
+                except Exception:
+                    output_active = False
+                    output_path = None
+                if not output_active:
+                    self._begin_recording_finalization(
+                        output_path or self._latest_stopped_output_path(),
+                        reason="OBS 编码器错误窗口",
+                    )
+            self.log(reason)
 
     def open_settings(self):
         dialog = SettingsDialog(
@@ -1041,16 +1321,21 @@ class RecorderApp(QWidget):
         elif state == "已停止":
             self.state_label.setText("录制状态：已停止")
             self.state_label.setStyleSheet("font-size: 20px; color: gray; font-weight: bold;")
+        elif "故障" in state:
+            self.state_label.setText(f"录制状态：{state}")
+            self.state_label.setStyleSheet(
+                "font-size: 20px; color: #b91c1c; font-weight: bold;"
+            )
         else:
             self.state_label.setText(f"录制状态：{state}")
             self.state_label.setStyleSheet("font-size: 20px; color: black; font-weight: bold;")
 
     def update_info(self):
-        tracking = self.current_tracking_number if self.current_tracking_number else "-"
+        tracking = self.current_tracking_number or self.fault_tracking_number or "-"
         self.tracking_label.setText(f"当前单号：{tracking}")
         self.info_label.setText(f"当前场景：{self.current_scene}")
         self.display_window.update_recording(
-            self.current_tracking_number,
+            self.current_tracking_number or self.fault_tracking_number,
             self.start_time,
         )
 
@@ -1373,12 +1658,12 @@ class RecorderApp(QWidget):
             except Exception:
                 pass
 
-    def launch_obs_and_prepare_windows(self):
+    def launch_obs_and_prepare_windows(self, force_launch=False):
         if sys.platform != "win32":
             self.focus_scan_input()
             return
 
-        if AUTO_LAUNCH_OBS and not get_obs_process_ids():
+        if (AUTO_LAUNCH_OBS or force_launch) and not get_obs_process_ids():
             executable = find_obs_executable()
             if executable is None:
                 self.log("未找到 OBS 安装目录，请手动启动 OBS；连接恢复后会继续运行")
@@ -1525,7 +1810,7 @@ class RecorderApp(QWidget):
         state_upper = state.upper()
         if "STARTED" in state_upper:
             active = True
-        elif any(word in state_upper for word in ("STOPPED", "ERROR")):
+        elif "STOPPED" in state_upper or is_obs_recording_failure_state(state_upper):
             active = False
         else:
             return
@@ -1537,11 +1822,20 @@ class RecorderApp(QWidget):
     def _on_obs_record_state_changed(self, active, output_path, state):
         if active:
             return
+        explicit_failure = is_obs_recording_failure_state(state)
+        if explicit_failure and self.recording_phase == "starting":
+            self._enter_encoder_fault(
+                f"OBS 报告录像启动失败：{state}",
+                self.current_tracking_number,
+            )
+            return
         if (
             self.current_tracking_number is not None
             and self.recording_phase in ("recording", "stopping", "waiting_reconnect")
         ):
             self.log(f"OBS 报告录像已结束：{state or 'STOPPED'}")
+            if explicit_failure:
+                self.fault_after_finalize_reason = f"OBS 录像输出失败：{state}"
             self._begin_recording_finalization(
                 output_path or self._latest_stopped_output_path(),
                 reason="OBS 状态事件",
@@ -1564,6 +1858,7 @@ class RecorderApp(QWidget):
         self.req_client = request_client
         self.event_client = event_client_instance
         self.connection_error_logged = False
+        self.restart_obs_button.setEnabled(True)
         self.obs_connection_label.setText("OBS 连接：已连接")
         self.obs_connection_label.setStyleSheet("font-size: 14px; color: green; font-weight: bold;")
         if event_warning:
@@ -1752,6 +2047,14 @@ class RecorderApp(QWidget):
         if not tracking_number:
             return
 
+        if self.encoder_fault_blocked:
+            self.log(
+                f"编码器故障尚未解除，忽略扫码：{tracking_number}；"
+                f"仍保留单号：{self.fault_tracking_number or '-'}"
+            )
+            QApplication.beep()
+            return
+
         # 特殊指令 STOPSTOP
         if tracking_number.upper() == "STOPSTOP":
             self.log("检测到 STOPSTOP 指令 → 停止录制")
@@ -1798,6 +2101,11 @@ class RecorderApp(QWidget):
             self.stop_recording(start_new_tracking_number=tracking_number)
 
     def start_recording(self, tracking_number):
+        if self.encoder_fault_blocked:
+            self.log(
+                f"编码器故障尚未解除，不能开始单号：{tracking_number}"
+            )
+            return
         if self.recording_phase != "idle" or self.current_tracking_number is not None:
             if tracking_number != self.current_tracking_number:
                 self.set_pending_tracking(tracking_number)
@@ -1850,6 +2158,12 @@ class RecorderApp(QWidget):
                 if bool(getattr(status, "output_active", False)):
                     self.log("OBS 实际已开始录制，已恢复本地状态")
                     self._mark_recording_confirmed()
+                    return
+                if is_likely_obs_recording_start_error(e):
+                    self._enter_encoder_fault(
+                        f"OBS 无法启动录像：{e}",
+                        self.current_tracking_number,
+                    )
                     return
                 self.log("OBS 暂未进入录制状态，将继续等待状态确认")
                 self.record_start_check_attempts = 0
@@ -1913,11 +2227,10 @@ class RecorderApp(QWidget):
         confirmation_seconds = (
             RECORD_START_CONFIRM_INTERVAL_MS * RECORD_START_CONFIRM_ATTEMPTS / 1000
         )
-        self.log(
-            f"OBS 在 {confirmation_seconds:g} 秒内未进入录制状态，"
-            f"取消单号：{failed_tracking_number}"
+        self._enter_encoder_fault(
+            f"OBS 在 {confirmation_seconds:g} 秒内未进入录制状态",
+            failed_tracking_number,
         )
-        self._reset_recording_state_and_continue()
 
     def _reset_recording_state_and_continue(
         self,
@@ -2179,6 +2492,15 @@ class RecorderApp(QWidget):
 
     def _on_recording_finalized(self, requested_next_tracking_number, success, error_message):
         self.update_failed_jobs_status()
+        if self.fault_after_finalize_reason:
+            tracking_number = self.current_tracking_number
+            reason = self.fault_after_finalize_reason
+            if success:
+                reason += "；故障前的视频片段已成功归档，重试会生成同单号的新文件"
+            elif error_message:
+                reason += f"；故障片段未能归档：{error_message}"
+            self._enter_encoder_fault(reason, tracking_number)
+            return
         if self.exit_after_finalize:
             self.exit_after_finalize = False
             self._reset_recording_state_and_continue(allow_continue=False)
@@ -2242,6 +2564,7 @@ class RecorderApp(QWidget):
         self.force_closing = True
         self.reconnect_timer.stop()
         self.window_arrange_timer.stop()
+        self.obs_error_timer.stop()
         self.poll_timer.stop()
         self.disk_timer.stop()
         self.keyboard_layout_timer.stop()
@@ -2267,6 +2590,22 @@ class RecorderApp(QWidget):
                 "正在恢复文件",
                 "保存失败任务仍在恢复中，请等待完成后再退出。",
             )
+            return
+
+        if self.encoder_fault_blocked:
+            answer = QMessageBox.question(
+                self,
+                "仍有单号未录制",
+                f"编码器故障尚未解除，单号 {self.fault_tracking_number or '-'} "
+                "仍未可靠录制。确认退出吗？",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            event.accept()
+            self._shutdown_and_quit()
             return
 
         if self.orphan_recording_blocked:
