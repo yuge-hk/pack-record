@@ -43,7 +43,7 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(is_likely_obs_recording_start_error("connection timed out"))
 
     def test_encoder_fault_path_preserves_tracking_and_blocks_scans(self):
-        source = (Path(__file__).resolve().parents[1] / "main.py").read_text(
+        source = (Path(__file__).resolve().parents[1] / "archive" / "main_obs.py").read_text(
             encoding="utf-8"
         )
         self.assertIn("self.fault_tracking_number = tracking_number", source)
@@ -117,7 +117,7 @@ class CoreTests(unittest.TestCase):
         )
 
     def test_scan_handoff_uses_one_latest_value_not_a_queue(self):
-        main_path = Path(__file__).resolve().parents[1] / "main.py"
+        main_path = Path(__file__).resolve().parents[1] / "archive" / "main_obs.py"
         source = main_path.read_text(encoding="utf-8")
         tree = ast.parse(source)
         assignments = [

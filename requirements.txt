@@ -1,2 +1,1 @@
 PySide6-Essentials>=6.8,<7
-obsws-python>=1.7,<2

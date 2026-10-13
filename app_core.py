@@ -176,7 +176,8 @@ class VideoDB:
         return self.json_dir / f"{time.strftime('%Y-%m-%d')}.jsonl"
 
     def insert_record(self, barcode, start_time, end_time, duration,
-                      video_path, file_size, resolution, fps, recording_id=None):
+                      video_path, file_size, resolution, fps, recording_id=None,
+                      metadata=None):
         record = {
             "schema_version": 2,
             "recording_id": recording_id,
@@ -190,6 +191,8 @@ class VideoDB:
             "fps": fps,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
+        if metadata:
+            record["capture"] = dict(metadata)
         with self.lock:
             path = self._get_json_path()
             if recording_id:

@@ -13,6 +13,11 @@ logs/
 *.log
 settings.json
 settings.json.corrupt-*
+recorder-settings.json
+recorder-settings.json.corrupt-*
+recordings-in-progress/
+tools/*
+!tools/README.md
 
 # Packaging and test caches
 build/
