@@ -4,6 +4,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -17,7 +18,19 @@ FRAME_BYTES = PREVIEW_WIDTH * PREVIEW_HEIGHT * 3
 
 
 def process_options():
-    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    if getattr(sys, "frozen", False):
+        # PyInstaller prepends bundled Qt/Python libraries to LD_LIBRARY_PATH.
+        # System FFmpeg must use the original system library search path.
+        environment = os.environ.copy()
+        original = environment.get("LD_LIBRARY_PATH_ORIG")
+        if original is None:
+            environment.pop("LD_LIBRARY_PATH", None)
+        else:
+            environment["LD_LIBRARY_PATH"] = original
+        return {"env": environment}
+    return {}
 
 
 def run_tool(arguments, timeout=15):
@@ -63,7 +76,8 @@ def discover_devices(settings, platform=None):
     microphones = []
     if settings["audio_backend"] == "pulse":
         try:
-            result = subprocess.run(["pactl", "-f", "json", "list", "sources"], capture_output=True, timeout=5)
+            result = subprocess.run(["pactl", "-f", "json", "list", "sources"], capture_output=True, timeout=5,
+                                    **process_options())
             if result.returncode == 0:
                 microphones = [(source.get("description", source["name"]), source["name"])
                                for source in json.loads(result.stdout)

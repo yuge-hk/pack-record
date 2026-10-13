@@ -56,7 +56,7 @@ def main(binary_dir, output):
     size = sum(p.stat().st_size for p in portable.rglob('*') if p.is_file()) // 1024
     (stage / 'DEBIAN' / 'control').write_text(f'Package: pack-record\nVersion: 2.0.0-1\n'
         f'Architecture: amd64\nMaintainer: mada <madayouxi@outlook.com>\nInstalled-Size: {size}\n'
-        'Depends: libc6 (>= 2.41), libstdc++6, libgcc-s1, libgl1, libegl1, ffmpeg (>= 7:7.0), fonts-noto-cjk\n'
+        'Depends: libc6 (>= 2.41), libstdc++6, libgcc-s1, libgl1, libegl1, libgtk-3-0t64, ffmpeg (>= 7:7.0), fonts-noto-cjk\n'
         'Recommends: pulseaudio-utils, v4l-utils, intel-media-va-driver\nSection: video\nPriority: optional\n'
         'Homepage: http://192.168.0.175:3000/mada/pack-record\n'
         'Description: USB camera and microphone shipping recorder\n'

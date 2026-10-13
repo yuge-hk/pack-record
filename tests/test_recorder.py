@@ -295,6 +295,15 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.jobs.count(), 0)
         self.assertEqual(self.controller.snapshot()['fault_tracking'], 'A')
 
+    def test_low_disk_blocks_capture_without_spawning_ffmpeg(self):
+        usage = shutil_usage()._replace(free=256 * 1024**2)
+        with patch('recording_controller.shutil.disk_usage', return_value=usage):
+            self.controller.scan('LOW-DISK')
+            wait_for(lambda: self.controller.snapshot()['state'] == 'fault')
+        self.assertEqual(self.sessions, [])
+        self.assertEqual(self.controller.jobs.count(), 0)
+        self.assertEqual(self.controller.snapshot()['fault_tracking'], 'LOW-DISK')
+
 
 def shutil_usage():
     from collections import namedtuple
@@ -425,6 +434,16 @@ while True:
         self.assertIn('Encoder initialization failed', result.error)
 
 class PackagedPathsTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Linux loader behavior')
+    def test_frozen_process_restores_system_library_path(self):
+        import sys
+        from ffmpeg_backend import process_options
+        with patch.object(sys, 'frozen', True, create=True):
+            with patch.dict(os.environ, {'LD_LIBRARY_PATH': '/bundled', 'LD_LIBRARY_PATH_ORIG': '/system'}):
+                self.assertEqual(process_options()['env']['LD_LIBRARY_PATH'], '/system')
+            with patch.dict(os.environ, {'LD_LIBRARY_PATH': '/bundled'}, clear=True):
+                self.assertNotIn('LD_LIBRARY_PATH', process_options()['env'])
+
     def test_installed_linux_application_uses_user_data_directory(self):
         import sys
         from recorder_settings import application_dir, runtime_dir

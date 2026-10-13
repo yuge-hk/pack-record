@@ -147,6 +147,7 @@ Windows EXE 在 Windows 构建，Linux 可执行文件在 Linux 构建。
 
 Linux：在 Debian 13 amd64 安装系统 FFmpeg 7+ 后执行 `bash build-linux.sh`，输出
 `dist/releases/` 下的 `.deb` 和 `.tar.gz`。Linux 构建使用系统 FFmpeg。
+构建机还需要 `libpython3.13`（`sudo apt install libpython3.13`）；用户安装二进制包不需要 Python。
 
 发布的 Windows 11 x64 便携包包含官方 Python 嵌入式运行库、Windows Qt 和 FFmpeg，
 解压后双击 `Start-PackRecord.cmd`，无需安装 Python。该格式由

@@ -102,6 +102,15 @@ class GuiTests(unittest.TestCase):
                         ffmpeg_path=os.environ['ECOM_TEST_FFMPEG'], ffprobe_path=os.environ['ECOM_TEST_FFPROBE'])
         RecorderSettingsStore(self.directory.name).save(settings)
 
+        # Media integration needs only a small synthetic file. Check the disk
+        # threshold separately rather than requiring 1 GB of free CI tmpfs.
+        from collections import namedtuple
+        usage = namedtuple('usage', 'total used free')(2 * 1024**3, 0, 2 * 1024**3)
+        disk_patch = patch('recording_controller.shutil.disk_usage', return_value=usage)
+        disk_patch.start()
+        self.addCleanup(disk_patch.stop)
+        self.addCleanup(self.close_window)
+
         def factory(settings, directory, notify):
             return RecordingController(settings, directory, notify,
                                        lambda s, path: CaptureSession(s, path, synthetic=True))
