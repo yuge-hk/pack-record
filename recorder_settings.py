@@ -12,6 +12,15 @@ def application_dir():
     return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 
 
+def runtime_dir():
+    """Installed/portable binary packages keep mutable files in the user profile."""
+    if not (getattr(sys, "frozen", False) or getattr(sys, "_pack_record_bundle", False)):
+        return application_dir()
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "PackRecord"
+    return Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "pack-record"
+
+
 def find_tool(name, configured=""):
     if configured:
         resolved = shutil.which(configured)

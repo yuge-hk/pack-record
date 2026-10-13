@@ -1,21 +1,27 @@
 # -*- coding: utf-8 -*-
 """Cross-platform USB camera shipping recorder. FFmpeg owns all media capture."""
 import hashlib
+import json
 import logging
 import os
+import platform
 import shutil
 import sys
+import tempfile
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QLockFile, QStandardPaths, QTimer, Qt, Signal
+if "--self-test" in sys.argv:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QEvent, QLockFile, QStandardPaths, QTimer, Qt, Signal, qVersion
 from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QTextEdit, QVBoxLayout, QWidget)
 
-from ffmpeg_backend import PREVIEW_HEIGHT, PREVIEW_WIDTH
-from recorder_settings import RecorderSettingsStore, application_dir
+from ffmpeg_backend import PREVIEW_HEIGHT, PREVIEW_WIDTH, available_encoders, run_tool
+from recorder_settings import RecorderSettingsStore, find_tool, runtime_dir
 from recording_controller import RecordingController
 from settings_dialog import SettingsDialog
 
@@ -30,7 +36,7 @@ class RecorderApp(QWidget):
 
     def __init__(self, base_dir=None, controller_factory=RecordingController):
         super().__init__()
-        self.base_dir = Path(base_dir) if base_dir else application_dir()
+        self.base_dir = Path(base_dir) if base_dir else runtime_dir()
         self.store = RecorderSettingsStore(self.base_dir)
         self.settings = self.store.load()
         self.exiting = self.exit_ready = False
@@ -349,11 +355,47 @@ class RecorderApp(QWidget):
         self.input.setEnabled(False)
 
 
+def self_test(app):
+    """Headless package check; it never opens a camera or changes real settings."""
+    report = dict(version=APP_VERSION, system=platform.system(), machine=platform.machine(),
+                  python=platform.python_version(), qt=qVersion(), hardware_capture_tested=False)
+    try:
+        with tempfile.TemporaryDirectory(prefix="pack-record-check-") as directory:
+            window = RecorderApp(directory)
+            window.show()
+            QTimer.singleShot(100, window.close)
+            QTimer.singleShot(5000, app.quit)
+            app.exec()
+            window.controller.close()
+            window.controller.thread.join(timeout=5)
+            if window.controller.thread.is_alive():
+                raise RuntimeError("界面关闭后录制线程未停止")
+            report["gui"] = "ok"
+            settings = RecorderSettingsStore(directory).defaults()
+            for tool in ("ffmpeg", "ffprobe"):
+                executable = find_tool(tool)
+                code, output = run_tool([executable, "-version"])
+                if code:
+                    raise RuntimeError(f"{tool} 无法运行")
+                report[tool] = output.splitlines()[0]
+            encoders = available_encoders(settings)
+            report["encoders"] = sorted(encoders & {"h264_qsv", "hevc_qsv", "aac", "libx264", "libx265"})
+            if not {"h264_qsv", "hevc_qsv", "aac"} <= encoders:
+                raise RuntimeError("FFmpeg 缺少 QSV 或 AAC 编译支持")
+        report["status"] = "ok"
+    except Exception as error:
+        report.update(status="failed", error=str(error))
+    print(json.dumps(report, indent=2))
+    return 0 if report["status"] == "ok" else 1
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("pack-record")
     app.setApplicationVersion(APP_VERSION)
-    base = application_dir()
+    if "--self-test" in sys.argv:
+        return self_test(app)
+    base = runtime_dir()
     key = hashlib.sha256(str(base).encode()).hexdigest()[:20]
     lock = QLockFile(str(Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / f"ecom-recorder-{key}.lock"))
     lock.setStaleLockTime(0)

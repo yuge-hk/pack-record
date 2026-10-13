@@ -37,7 +37,8 @@ sudo apt install ffmpeg v4l-utils pulseaudio-utils
 
 Linux 的 PySide6 还依赖系统图形库。缺少库时按导入错误安装对应包；例如
 `libxkbcommon0`。Qt 的 X11 插件可能需要 `libxcb-cursor0` 等桌面库。
-程序目录需要可写，不建议放入 `Program Files`。
+源码运行时项目目录需要可写。二进制包的设置、日志与默认录像写入用户目录：
+Windows 为 `%LOCALAPPDATA%\PackRecord`，Linux 为 `${XDG_DATA_HOME:-~/.local/share}/pack-record`。
 
 ## 首次配置
 
@@ -144,8 +145,23 @@ Windows：先准备 `tools/ffmpeg.exe` 和 `tools/ffprobe.exe`，再执行：
 构建 EXE 与包含 FFmpeg 工具的 ZIP，输出在 `dist/`。Python 打包本身不能跨平台：
 Windows EXE 在 Windows 构建，Linux 可执行文件在 Linux 构建。
 
-Linux：安装系统 FFmpeg 7+ 后执行 `bash build-linux.sh`，输出
-`dist/pack-record`。Linux 构建仍使用本机安装的 FFmpeg 和图形库。
+Linux：在 Debian 13 amd64 安装系统 FFmpeg 7+ 后执行 `bash build-linux.sh`，输出
+`dist/releases/` 下的 `.deb` 和 `.tar.gz`。Linux 构建使用系统 FFmpeg。
+
+发布的 Windows 11 x64 便携包包含官方 Python 嵌入式运行库、Windows Qt 和 FFmpeg，
+解压后双击 `Start-PackRecord.cmd`，无需安装 Python。该格式由
+`packaging/build_windows_portable.py` 组装，不是跨平台编译的 PyInstaller EXE。
+依赖版本与输入校验值保存在包内 `BUILD-INFO.json`。
+
+Debian 13 推荐安装 `.deb`：
+
+```bash
+sudo apt install ./pack-record_2.0.0-1_amd64.deb
+pack-record
+```
+
+`pack-record --self-test`（Windows 使用 `Check-PackRecord.cmd`）检查界面、线程关闭
+和编码器编译支持；不代表已经验证摄像头或 QSV 硬件。
 
 设备接口与编码参数依据 [FFmpeg 设备文档](https://ffmpeg.org/ffmpeg-devices.html)、
 [编码器文档](https://ffmpeg.org/ffmpeg-codecs.html) 和

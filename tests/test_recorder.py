@@ -424,6 +424,27 @@ while True:
         self.assertFalse(result.confirmed)
         self.assertIn('Encoder initialization failed', result.error)
 
+class PackagedPathsTests(unittest.TestCase):
+    def test_installed_linux_application_uses_user_data_directory(self):
+        import sys
+        from recorder_settings import application_dir, runtime_dir
+        with patch.object(sys, 'frozen', True, create=True), patch.object(sys, 'executable', '/opt/pack-record/pack-record'):
+            with patch.dict(os.environ, {'XDG_DATA_HOME': '/tmp/test-user-data'}):
+                self.assertEqual(application_dir(), Path('/opt/pack-record'))
+                if os.name != 'nt':
+                    self.assertEqual(runtime_dir(), Path('/tmp/test-user-data/pack-record'))
+
+    def test_embedded_portable_runtime_uses_profile_data(self):
+        import sys
+        from recorder_settings import runtime_dir
+        with patch.object(sys, '_pack_record_bundle', True, create=True):
+            if os.name == 'nt':
+                with patch.dict(os.environ, {'LOCALAPPDATA': '/tmp/test-local-data'}):
+                    self.assertEqual(runtime_dir(), Path('/tmp/test-local-data/PackRecord'))
+            else:
+                with patch.dict(os.environ, {'XDG_DATA_HOME': '/tmp/test-user-data'}):
+                    self.assertEqual(runtime_dir(), Path('/tmp/test-user-data/pack-record'))
+
 
 if __name__ == '__main__':
     unittest.main()

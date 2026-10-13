@@ -8,5 +8,7 @@ fi
 command -v ffmpeg >/dev/null
 command -v ffprobe >/dev/null
 python3 -m pip install -r requirements-build.txt
-python3 -m PyInstaller --noconfirm --clean --onefile --name pack-record main.py
-echo 'Build complete: dist/pack-record（使用本机 FFmpeg 和图形库）'
+python3 -m PyInstaller --noconfirm --clean --onedir --name pack-record main.py
+dist/pack-record/pack-record --self-test
+python3 packaging/build_debian.py --binary-dir dist/pack-record --output dist/releases
+echo 'Build complete: dist/releases（Debian 13 amd64，使用系统 FFmpeg）'
