@@ -6,6 +6,9 @@ from pathlib import Path
 
 sys._pack_record_bundle = True
 try:
+    if '--service' in sys.argv:
+        from recorder_service import main
+        sys.exit(main([arg for arg in sys.argv[1:] if arg != '--service']))
     from main import main
     sys.exit(main())
 except Exception:

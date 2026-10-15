@@ -1,0 +1,25 @@
+[Unit]
+Description=PackRecord recording service
+After=local-fs.target sound.target
+
+[Service]
+Type=simple
+User=pack-record
+Group=pack-record
+SupplementaryGroups=video render audio
+StateDirectory=pack-record
+StateDirectoryMode=0750
+UMask=0027
+ExecStart=/opt/pack-record/pack-record --service --data-dir /var/lib/pack-record
+Restart=on-failure
+RestartSec=5
+# Finalize FFmpeg and archive before shutdown. Never force kill on a short timeout.
+TimeoutStopSec=infinity
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

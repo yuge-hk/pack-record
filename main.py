@@ -12,6 +12,11 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# Dispatch before importing Qt so the daemon works without a desktop session.
+if __name__ == "__main__" and "--service" in sys.argv:
+    from recorder_service import main as service_main
+    raise SystemExit(service_main([value for value in sys.argv[1:] if value != "--service"]))
+
 if "--self-test" in sys.argv:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -28,16 +33,16 @@ from settings_dialog import SettingsDialog
 APP_VERSION = "2.0.0"
 STATE_LABELS = dict(idle="等待扫码", starting="正在启动录制", recording="录制中",
                     saving="正在保存", preview_starting="正在打开试拍", preview="试拍预览（不保存）",
-                    recovering="正在恢复保存任务", fault="故障锁定", closed="已退出")
+                    disconnected="录像服务连接中断", recovering="正在恢复保存任务", fault="故障锁定", closed="已退出")
 
 
 class RecorderApp(QWidget):
     backend_event = Signal(str, object)
 
-    def __init__(self, base_dir=None, controller_factory=RecordingController):
+    def __init__(self, base_dir=None, controller_factory=RecordingController, settings_store=None):
         super().__init__()
         self.base_dir = Path(base_dir) if base_dir else runtime_dir()
-        self.store = RecorderSettingsStore(self.base_dir)
+        self.store = settings_store or RecorderSettingsStore(self.base_dir)
         self.settings = self.store.load()
         self.exiting = self.exit_ready = False
         self.previous_session, self.previous_serial = None, 0
@@ -256,6 +261,14 @@ class RecorderApp(QWidget):
 
     def update_storage(self):
         try:
+            if getattr(self.controller, 'remote', False):
+                storage = self.controller.status['storage']
+                remaining = self.controller.jobs.count()
+                def space(value):
+                    return '不可用' if value is None else f'{value:.1f} GB'
+                self.disk_label.setText(f"归档盘 {space(storage['archive'])} · 临时盘 {space(storage['staging'])} · 待恢复 {remaining} 个")
+                self.recover_button.setText(f"恢复保存任务（{remaining}）")
+                return
             path = Path(self.settings["record_path"])
             path.mkdir(parents=True, exist_ok=True)
             staging = self.base_dir / "recordings-in-progress"
@@ -285,12 +298,14 @@ class RecorderApp(QWidget):
             self.retry_button.setVisible(fault)
             self.retry_button.setEnabled(state == "fault" and self.controller.session is None and not self.exiting)
             self.fault_label.setText(f"扫码已锁定，保留单号：{data['fault_tracking'] or '—'}\n{data['error'][:1500]}")
-            self.input.setEnabled(state != "fault" and not fault and not self.exiting)
+            self.input.setEnabled(state not in ("fault", "disconnected", "closed") and not fault and not self.exiting)
             configurable = state in ("idle", "fault") and self.controller.session is None and not data["pending"] and not self.exiting
             self.settings_button.setEnabled(configurable)
             self.recover_button.setEnabled(configurable)
             self.preview_button.setEnabled(state == "idle" and configurable)
-            self.stop_button.setEnabled(state not in ("fault", "closed", "recovering") and not self.exiting)
+            self.stop_button.setEnabled(state not in ("fault", "closed", "recovering", "disconnected") and not self.exiting)
+            if state == "disconnected":
+                self.preview_label.setText("与录像服务断开，正在重连…")
             if state in ("idle", "fault") and self.controller.session is None:
                 self.preview_label.clear()
                 self.preview_label.setText("等待扫码" if state == "idle" else "采集故障，请检查设备和设置")
@@ -329,6 +344,11 @@ class RecorderApp(QWidget):
             self.log_handler.close()
             self.logger.removeHandler(self.log_handler)
             event.accept()
+            return
+        if getattr(self.controller, 'remote', False):
+            self.controller.close()
+            self.exit_ready = True
+            self.closeEvent(event)
             return
         event.ignore()
         if self.exiting:
@@ -390,22 +410,44 @@ def self_test(app):
 
 
 def main():
-    app = QApplication(sys.argv)
+    import argparse
+    parser = argparse.ArgumentParser(description="PackRecord desktop")
+    parser.add_argument('--connect', action='store_true', help='连接本机后台服务')
+    parser.add_argument('--data-dir', type=Path, default=runtime_dir())
+    parser.add_argument('--port', type=int, default=18765)
+    parser.add_argument('--token-file', type=Path)
+    parser.add_argument('--self-test', action='store_true')
+    args = parser.parse_args()
+    app = QApplication([sys.argv[0]])
     app.setApplicationName("pack-record")
     app.setApplicationVersion(APP_VERSION)
     if "--self-test" in sys.argv:
         return self_test(app)
-    base = runtime_dir()
+    base = args.data_dir
     key = hashlib.sha256(str(base).encode()).hexdigest()[:20]
     lock = QLockFile(str(Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / f"ecom-recorder-{key}.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock(0):
         QMessageBox.warning(None, "程序已运行", "这个目录中的发货录像程序已经运行。")
         return 1
+    data_lock = None
     try:
-        window = RecorderApp(base)
+        if args.connect:
+            from service_client import ServiceClient, RemoteController, RemoteSettingsStore
+            token = (args.token_file or base / 'service.token').read_text().strip()
+            client = ServiceClient(token, args.port)
+            window = RecorderApp(base, lambda settings, directory, notify:
+                                 RemoteController(settings, directory, notify, client),
+                                 RemoteSettingsStore(client, base))
+        else:
+            from recorder_service import DataLock
+            data_lock = DataLock(base)
+            data_lock.__enter__()
+            window = RecorderApp(base)
     except Exception as error:
-        QMessageBox.critical(None, "无法启动", f"请确认程序目录具有写入权限。\n{error}")
+        if data_lock:
+            data_lock.__exit__()
+        QMessageBox.critical(None, "无法启动", f"请检查服务连接或数据目录权限。\n{error}")
         return 1
     window.show()
     try:
@@ -414,6 +456,8 @@ def main():
         window.controller.close()
         window.controller.thread.join()
         lock.unlock()
+        if data_lock:
+            data_lock.__exit__()
 
 
 if __name__ == "__main__":

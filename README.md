@@ -167,3 +167,97 @@ pack-record
 设备接口与编码参数依据 [FFmpeg 设备文档](https://ffmpeg.org/ffmpeg-devices.html)、
 [编码器文档](https://ffmpeg.org/ffmpeg-codecs.html) 和
 [进度/数据包统计文档](https://ffmpeg.org/ffmpeg.html) 实现。
+
+## 后台服务与桌面连接（基础版）
+
+保留原来的桌面独立运行方式，新增本机后台服务模式。两个模式不能共用同一个
+数据目录同时运行。服务模式下，关闭桌面窗口只断开界面，录像继续运行；停止服务
+会先通知 FFmpeg 正常收尾并等待归档。服务 API 仅监听 `127.0.0.1`，当前不提供远程
+Web 页面、Windows Service 注册、上传和自动清理。
+
+源码运行（两个终端，使用同一 Python 环境）：
+
+```bash
+# 终端一：无需导入 Qt，可在没有图形会话时运行
+python recorder_service.py --data-dir ./station-data
+# 终端二：保留本机 Qt 操作界面
+python main.py --connect --token-file ./station-data/service.token
+```
+
+桌面设置由服务验证、持久化，桌面自身的日志仍写入桌面用户的数据目录。
+断开连接时禁用扫码和操作，自动重连；断线期间的扫码不会缓存或重放。
+后台扫码枪直读尚未实现，当前扫码仍由已连接的桌面界面接收。
+配置设备诊断仍在本机桌面进程执行，因此此版本仅支持同机连接。
+
+### Debian 服务部署
+
+`.deb` 额外安装 `pack-record.service` 和专用 `pack-record` 系统用户。
+为避免接管现有桌面安装，安装不会自动启用服务。首次设置：
+
+```bash
+sudo usermod -aG pack-record "$USER"
+# 注销并重新登录，使组权限生效
+sudo systemctl enable --now pack-record.service
+pack-record --connect --token-file /var/lib/pack-record/service.token
+```
+
+服务数据保存在 `/var/lib/pack-record`，默认视频在其 `recordings/` 下。
+桌面需要对 `service.token` 的读取权限；`pack-record` 组成员有权控制录像和修改配置，
+仅应添加受信任的操作人员。令牌通过认证头传输，不要将令牌放入 URL 或命令行。
+后台用户拥有 `video`、`render`、`audio` 组权限。外置录像盘需管理员挂载到固定目录，
+并赋予 `pack-record` 用户读写权限；家目录受服务沙箱保护，不建议作为录像目录。
+
+无桌面会话时，默认 PulseAudio 可能不可用；应在设置中选择 ALSA 和实际麦克风设备，
+完成一次带声音的试录。摄像头、麦克风及 QSV 必须在目标工位验收。
+升级会先停止服务并保存当前录像；升级后管理员检查并重新启动服务。
+卸载保留数据目录及录像。切回独立桌面模式前先停止服务，避免争抢设备。
+
+### Windows EXE 兼容入口
+
+现有 Windows PyInstaller 构建保留以下入口：
+
+```powershell
+# 后台进程（基础版尚未注册为 Windows Service）
+.\pack-record.exe --service --data-dir C:\PackRecordData
+# 本机桌面客户端
+.\pack-record.exe --connect --token-file C:\PackRecordData\service.token
+```
+
+嵌入式 Python 便携包可用其 Python 执行 `recorder_service.py`，或给 `bootstrap.py`
+传入 `--service`。Windows 应使用目录 ACL 限制令牌读取权限。
+Windows EXE 必须在 Windows 构建；此版本尚未完成 Windows 服务会话内的设备验收。
+
+### 本机 API
+
+默认端口 `18765`，服务与桌面可通过 `--port` 指定其他端口。
+所有接口均要求 `Authorization: Bearer <service.token 文件内容>`：
+
+- `GET /v1/status?after=序号`：状态、设备配置、磁盘空间、恢复任务数、有限事件历史。
+- `GET /v1/frame`：当前 RGB24 640×360 预览帧，无帧时返回空内容。
+- `POST /v1/commands/scan`：JSON `{"tracking":"单号"}`。
+- `POST /v1/commands/stop`、`preview`、`retry_fault`、`recover`：JSON `{}`。
+- `POST /v1/commands/configure`：完整录像设置 JSON，服务统一保存。
+
+事件历史只用于界面提示，不代替录像持久记录。客户端每次同时取得完整当前状态，
+服务重启或断线不会根据旧事件重放控制命令。
+
+## GitHub Windows 自动构建
+
+`.github/workflows/windows-build.yml` 在 Windows Server 2022 runner 上运行。
+推送 `main`、推送 `v*` 标签、向 `main` 提交 PR 或手动执行均可触发：
+
+1. 安装 Python 3.13、测试和打包依赖，构建版本约束见 `.github/build-constraints.txt`。
+2. 下载固定版本的 Windows FFmpeg 并验证仓库中固定的 SHA256，同时保留许可证和文档。
+3. 运行单元测试、无界面 Qt 测试和 FFmpeg 合成音视频测试。
+4. 用 PyInstaller 生成 `pack-record.exe`，打包包含 FFmpeg 的 ZIP。
+5. 执行包内 GUI 自检，将 ZIP、SHA256 和测试报告上传为 Actions artifacts。
+
+在 GitHub 仓库的 **Actions → Windows EXE → Run workflow** 可以手动构建。
+运行成功后，在该次运行的 **Artifacts → pack-record-windows-x64** 下载产物，
+解开 artifact 后再解压其中的发布 ZIP，运行 `pack-record.exe`。
+需要保留 EXE 同目录的 `tools/`，无需安装 Python。
+工作流只生成可下载产物，不自动发布 Release；首次 Windows 构建仍需实际运行确认。
+GitHub 托管 runner 不提供实际 USB 摄像头或目标 QSV 设备，构建成功不代表硬件验收通过。
+
+本机 Windows 构建可先运行 `python packaging/fetch_windows_ffmpeg.py`，
+再执行 `./build-windows.ps1`。程序正常启动时不会联网下载 FFmpeg。

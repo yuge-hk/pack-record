@@ -30,13 +30,14 @@ def main(binary_dir, output):
     (portable / 'README.txt').write_text('PackRecord 2.0.0 — Debian 13 amd64\n\n'
         '便携包：安装系统 FFmpeg 后，运行 ./pack-record。无需 Python 或 OBS。\n'
         '安装依赖：sudo apt install ffmpeg libgl1 libegl1 libxcb-cursor0 fonts-noto-cjk pulseaudio-utils\n'
-        '如有 .deb 文件，优先用 sudo apt install ./pack-record_2.0.0-1_amd64.deb 安装。\n'
+        '如有 .deb 文件，优先用 sudo apt install ./pack-record_2.0.0-2_amd64.deb 安装。\n'
         '设置、日志、待恢复任务与默认录像：${XDG_DATA_HOME:-~/.local/share}/pack-record。\n'
         '首次启动配置摄像头和麦克风，按实际磁盘容量选择录像目录。\n'
         '默认 2560×1440 / 30 FPS / H.265 QSV / AAC / MKV。QSV 需要 Intel 驱动与 render 设备访问权限。\n'
         './pack-record --self-test 检查运行库，不验证摄像头或实际 QSV 编码。\n', encoding='utf-8')
     (portable / 'BUILD-INFO.json').write_text(json.dumps(dict(version='2.0.0', target='Debian 13 amd64',
         source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+        working_tree_dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip()),
         versions={name: importlib.metadata.version(name) for name in ('PySide6-Essentials', 'shiboken6', 'pyinstaller')},
         ffmpeg='System package (7+)', hardware_capture_tested=False), indent=2), encoding='utf-8')
     archive = output / (portable.name + '.tar.gz')
@@ -53,15 +54,52 @@ def main(binary_dir, output):
     (desktops / 'pack-record.desktop').write_text('[Desktop Entry]\nType=Application\nName=PackRecord\n'
         'Name[zh_CN]=打包录像\nComment=USB camera shipping recorder\nExec=pack-record\n'
         'Icon=camera-video\nTerminal=false\nCategories=AudioVideo;Video;\n', encoding='utf-8')
+    (desktops / 'pack-record-service.desktop').write_text(
+        '[Desktop Entry]\nType=Application\nName=PackRecord Service Client\n'
+        'Name[zh_CN]=打包录像（后台服务）\n'
+        'Exec=pack-record --connect --token-file /var/lib/pack-record/service.token\n'
+        'Icon=camera-video\nTerminal=false\nCategories=AudioVideo;Video;\n', encoding='utf-8')
     size = sum(p.stat().st_size for p in portable.rglob('*') if p.is_file()) // 1024
-    (stage / 'DEBIAN' / 'control').write_text(f'Package: pack-record\nVersion: 2.0.0-1\n'
+    (stage / 'DEBIAN' / 'control').write_text(f'Package: pack-record\nVersion: 2.0.0-2\n'
         f'Architecture: amd64\nMaintainer: mada <madayouxi@outlook.com>\nInstalled-Size: {size}\n'
-        'Depends: libc6 (>= 2.41), libstdc++6, libgcc-s1, libgl1, libegl1, libgtk-3-0t64, ffmpeg (>= 7:7.0), fonts-noto-cjk\n'
+        'Depends: adduser, libxkbcommon0, libxcb-cursor0, libc6 (>= 2.41), libstdc++6, libgcc-s1, libgl1, libegl1, libgtk-3-0t64, ffmpeg (>= 7:7.0), fonts-noto-cjk\n'
         'Recommends: pulseaudio-utils, v4l-utils, intel-media-va-driver\nSection: video\nPriority: optional\n'
         'Homepage: http://192.168.0.175:3000/mada/pack-record\n'
         'Description: USB camera and microphone shipping recorder\n'
         ' Cross-platform scan-to-record application using FFmpeg and Intel QSV.\n', encoding='utf-8')
-    deb = output / 'pack-record_2.0.0-1_amd64.deb'
+    units = stage / 'usr' / 'lib' / 'systemd' / 'system'
+    units.mkdir(parents=True)
+    shutil.copy2(ROOT / 'packaging/systemd/pack-record.service', units / 'pack-record.service')
+    scripts = {
+        'postinst': """#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    for group in pack-record video render audio; do
+        getent group "$group" >/dev/null || addgroup --system "$group"
+    done
+    id pack-record >/dev/null 2>&1 || adduser --system --ingroup pack-record --home /var/lib/pack-record --no-create-home pack-record
+    install -d -o pack-record -g pack-record -m 0750 /var/lib/pack-record
+    if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
+fi
+""",
+        'prerm': """#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    if [ "$1" = remove ]; then systemctl disable --now pack-record.service; fi
+    if [ "$1" = upgrade ]; then systemctl stop pack-record.service; fi
+fi
+""",
+        'postrm': """#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
+# User configuration and recordings are deliberately preserved on removal.
+""",
+    }
+    for name, content in scripts.items():
+        script = stage / 'DEBIAN' / name
+        script.write_text(content, encoding='utf-8')
+        script.chmod(0o755)
+    deb = output / 'pack-record_2.0.0-2_amd64.deb'
     subprocess.run(['dpkg-deb', '--root-owner-group', '--build', str(stage), str(deb)], check=True)
     print(json.dumps({'deb': str(deb), 'tar': str(archive)}))
 

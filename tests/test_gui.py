@@ -32,7 +32,7 @@ class GuiTests(unittest.TestCase):
         cls.app = TEST_APP
 
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(dir='/tmp')
+        self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.window = RecorderApp(self.directory.name)
         self.window_disposed = False
@@ -129,3 +129,43 @@ class GuiTests(unittest.TestCase):
         self.assertGreater(videos[0].stat().st_size, 1024)
         self.assertEqual(self.window.controller.jobs.count(), 0)
         self.assertFalse(self.window.controller.thread.is_alive())
+
+
+@unittest.skipUnless(QT_AVAILABLE, 'Qt and its system libraries are required')
+class ServiceGuiTests(unittest.TestCase):
+    def test_closing_connected_window_leaves_service_alive(self):
+        import threading
+        from recorder_service import RecorderService, RecorderHTTPServer
+        from service_client import ServiceClient, RemoteController, RemoteSettingsStore
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            service = RecorderService(Path(directory) / 'service')
+            server = RecorderHTTPServer(('127.0.0.1', 0), service, 'test-token')
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01})
+            thread.start()
+            window = None
+            try:
+                client = ServiceClient('test-token', server.server_port)
+                base = Path(directory) / 'desktop'
+                window = RecorderApp(base, lambda settings, directory, notify:
+                                     RemoteController(settings, directory, notify, client),
+                                     RemoteSettingsStore(client, base))
+                window.show()
+                app.processEvents()
+                window.close()
+                app.processEvents()
+                self.assertTrue(window.exit_ready)
+                self.assertFalse(service.controller.closing)
+                self.assertTrue(service.controller.thread.is_alive())
+                self.assertFalse((base / 'recorder-settings.json').exists())
+            finally:
+                if window:
+                    window.controller.close()
+                    window.controller.thread.join(3)
+                    window.close()
+                    window.deleteLater()
+                    app.sendPostedEvents(None, QEvent.DeferredDelete)
+                server.shutdown()
+                server.server_close()
+                thread.join()
+                service.close()

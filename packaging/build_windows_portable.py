@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_FILES = ('main.py', 'app_core.py', 'recorder_settings.py', 'ffmpeg_backend.py',
+APP_FILES = ('recorder_service.py', 'service_client.py', 'main.py', 'app_core.py', 'recorder_settings.py', 'ffmpeg_backend.py',
              'recording_controller.py', 'settings_dialog.py')
 
 

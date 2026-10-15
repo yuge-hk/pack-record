@@ -1,4 +1,7 @@
-param([string]$FFmpegDirectory = (Join-Path $PSScriptRoot "tools"))
+param(
+    [string]$FFmpegDirectory = (Join-Path $PSScriptRoot "tools"),
+    [switch]$SkipDependencyInstall
+)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 if ($env:OS -ne "Windows_NT") { throw "请在 Windows 上构建 Windows EXE" }
@@ -18,10 +21,12 @@ $encoders = (& $ffmpeg -hide_banner -encoders 2>&1) -join "`n"
 if ($LASTEXITCODE -ne 0 -or $encoders -notmatch '\bhevc_qsv\b' -or $encoders -notmatch '\bh264_qsv\b') {
     throw "此 FFmpeg 构建缺少 H.264/H.265 QSV 编码器"
 }
-python -m pip install -r requirements-build.txt
-if ($LASTEXITCODE -ne 0) { throw "构建依赖安装失败" }
+if (-not $SkipDependencyInstall) {
+    python -m pip install -r requirements-build.txt
+    if ($LASTEXITCODE -ne 0) { throw "构建依赖安装失败" }
+}
 python -m PyInstaller --noconfirm --clean --onefile --windowed `
-    --name "pack-record" --version-file "build\windows_version_info.txt" "main.py"
+    --name "pack-record" --specpath build --version-file "build\windows_version_info.txt" "main.py"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 构建失败" }
 $release = Join-Path "dist" "pack-record-v2.0.0-windows-x64"
 New-Item -ItemType Directory -Force -Path $release | Out-Null
@@ -31,4 +36,7 @@ $releaseTools = Join-Path $release "tools"
 New-Item -ItemType Directory -Force -Path $releaseTools | Out-Null
 Copy-Item (Join-Path $FFmpegDirectory "*") $releaseTools -Recurse -Force
 Compress-Archive -Path "$release\*" -DestinationPath "dist\pack-record-v2.0.0-windows-x64.zip" -Force
+$archive = "dist\pack-record-v2.0.0-windows-x64.zip"
+$digest = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+"$digest  $(Split-Path $archive -Leaf)" | Set-Content -Encoding ascii "$archive.sha256"
 Write-Host "Build complete: dist\pack-record-v2.0.0-windows-x64.zip"

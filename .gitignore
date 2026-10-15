@@ -35,3 +35,8 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local service credentials and instance ownership
+service.token
+service.lock
+station-data/

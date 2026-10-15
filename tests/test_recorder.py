@@ -314,7 +314,7 @@ def shutil_usage():
                      'Set ECOM_TEST_FFMPEG and ECOM_TEST_FFPROBE for real media integration tests')
 class MediaIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(dir='/tmp')
+        self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.settings = RecorderSettingsStore(self.directory.name).defaults()
         self.settings.update(width=640, height=360, encoder='libx264',
@@ -380,7 +380,7 @@ class MediaIntegrationTests(unittest.TestCase):
 class SessionFaultTests(unittest.TestCase):
     """Use real child processes to exercise watchdogs and forced shutdown."""
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(dir='/tmp')
+        self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.settings = RecorderSettingsStore(self.directory.name).defaults()
         self.settings.update(stall_timeout_seconds=3, stop_timeout_seconds=3, start_timeout_seconds=3)
@@ -444,6 +444,7 @@ class PackagedPathsTests(unittest.TestCase):
             with patch.dict(os.environ, {'LD_LIBRARY_PATH': '/bundled'}, clear=True):
                 self.assertNotIn('LD_LIBRARY_PATH', process_options()['env'])
 
+    @unittest.skipIf(os.name == 'nt', 'Linux installation paths')
     def test_installed_linux_application_uses_user_data_directory(self):
         import sys
         from recorder_settings import application_dir, runtime_dir
