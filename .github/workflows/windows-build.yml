@@ -51,7 +51,7 @@ jobs:
       - name: Check packaged GUI and thread shutdown
         shell: pwsh
         run: |
-          $process = Start-Process -FilePath (Resolve-Path dist/pack-record.exe).Path -ArgumentList '--self-test' -PassThru
+          $process = Start-Process -FilePath (Resolve-Path dist/pack-record-v2.0.0-windows-x64/pack-record.exe).Path -ArgumentList '--self-test' -PassThru
           if (-not $process.WaitForExit(60000)) {
             $process.Kill()
             throw 'Packaged self-test timed out'
