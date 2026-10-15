@@ -12,6 +12,9 @@ from app_core import (FailedJobStore, VideoDB, ensure_copy_space, move_recording
                       sanitize_tracking_filename, wait_for_recording_file_ready)
 from ffmpeg_backend import CaptureSession, available_encoders, probe_recording
 from recorder_settings import find_tool
+from recording_library import RecordingLibrary
+from storage_manager import StorageManager
+from station_manager import StationManager
 
 
 class RecordingController:
@@ -28,6 +31,12 @@ class RecordingController:
         self.stop_requested = False
         self.last_scan, self.last_scan_time = None, 0
         self.started_monotonic = None
+        self.library = RecordingLibrary(self.base_dir / 'records')
+        with self.library.connect() as db:
+            db.execute("UPDATE recordings SET station_id=?,station_name=? WHERE origin='local' AND (station_id='' OR station_id IS NULL)",
+                       (settings.get('station_id', ''), settings.get('station_name', '本机')))
+        self.storage = StorageManager(self.library, self.base_dir)
+        self.manager = StationManager(self)
         self.thread = threading.Thread(target=self._worker, name="recording-controller", daemon=False)
         self.thread.start()
 
@@ -48,6 +57,9 @@ class RecordingController:
         if not tracking:
             return False
         with self.condition:
+            if self.settings.get('role', 'integrated') not in ('integrated', 'station') or self.state == 'testing':
+                self._log('当前角色或试录期间不能接收扫码')
+                return False
             if self.closing or self.state == "fault" or self.fault_tracking or self.error:
                 self._log(f"故障或退出期间忽略扫码：{tracking}；保留单号：{self.fault_tracking or '-'}")
                 self.notify("beep", None)
@@ -81,6 +93,8 @@ class RecordingController:
 
     def preview(self):
         with self.condition:
+            if self.settings['role'] not in ('integrated', 'station'):
+                raise RuntimeError('当前节点不提供录像或试拍')
             if self.state != "idle" or self.pending or self.closing:
                 raise RuntimeError("请先停止录像再试拍预览")
             self.preview_requested = True
@@ -141,7 +155,7 @@ class RecordingController:
             while True:
                 with self.condition:
                     self.condition.wait_for(lambda: self.closing or self.recovery_requested or
-                                            (self.state != "fault" and (self.pending or self.preview_requested)))
+                                            (self.state not in ("fault", "testing") and (self.pending or self.preview_requested)))
                     if self.closing:
                         break
                     if self.recovery_requested:
@@ -174,13 +188,15 @@ class RecordingController:
                             self.state = "idle"
                         self._publish()
         finally:
+            self.manager.close()
             with self.condition:
                 self.state = "closed"
                 self._publish()
 
     def _check_space(self, settings):
         archive, staging = Path(settings["record_path"]), self.base_dir / "recordings-in-progress"
-        archive.mkdir(parents=True, exist_ok=True)
+        if not archive.is_dir() or (settings.get('_volume_device') is not None and archive.stat().st_dev != settings['_volume_device']):
+            raise OSError('录像磁盘已离线或被替换，请恢复原磁盘')
         staging.mkdir(parents=True, exist_ok=True)
         for name, path in (("归档盘", archive), ("临时录制盘", staging)):
             free = shutil.disk_usage(path).free / 1024**3
@@ -198,6 +214,9 @@ class RecordingController:
         return session
 
     def _record(self, tracking, settings):
+        settings = dict(settings)
+        settings['record_path'] = self.storage.select(settings)
+        settings['_volume_device'] = Path(settings['record_path']).stat().st_dev
         staging = self._check_space(settings)
         find_tool("ffprobe", settings["ffprobe_path"])
         if settings["encoder"] not in available_encoders(settings):
@@ -222,6 +241,7 @@ class RecordingController:
                 job["start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
                 self.jobs.upsert(job)
                 self._publish()
+            self.manager.orders.announce(tracking, identifier)
             self._log(f"已确认录制：{tracking} · {settings['encoder']}")
 
         def progress(data):
@@ -259,11 +279,18 @@ class RecordingController:
             except Exception as store_error:
                 self._log(f"恢复任务更新也失败：{store_error}；原始文件：{source}")
             raise
+        finally:
+            if self.manager.orders.active and self.manager.orders.active[1] == identifier:
+                self.manager.orders.active = None
 
     def _archive(self, job):
         settings = dict(job["settings"])
         # Tool paths can be repaired without rewriting the capture metadata.
         settings["ffprobe_path"] = self.settings["ffprobe_path"]
+        if settings.get('_volume_device') is not None and (
+                not Path(settings['record_path']).is_dir() or
+                not self.storage.volume_valid(settings['record_path'])):
+            raise OSError('原录像磁盘不在线，恢复任务及临时录像已保留')
         source = job["source_path"]
         planned = job.get("planned_destination")
         if source != planned and planned and os.path.isfile(source) and os.path.isfile(planned):
@@ -305,6 +332,7 @@ class RecordingController:
                                         duration, source, os.path.getsize(source),
                                         f"{settings['width']}x{settings['height']}", settings["fps"],
                                         recording_id=job["recording_id"],
+                                        station_id=settings.get('station_id'), station_name=settings.get('station_name'),
                                         metadata=dict(backend="ffmpeg", encoder=settings["encoder"],
                                                       quality=settings["quality"], preset=settings["preset"],
                                                       camera=settings["camera"], input_format=settings["input_format"],
@@ -312,6 +340,14 @@ class RecordingController:
                                                       audio_enabled=settings["audio_enabled"],
                                                       interrupted=job["interrupted"],
                                                       error=job.get("last_error", "")))
+            self.library.add(dict(id=job['recording_id'], barcode=job['tracking_number'],
+                                  start_time=job['start_time'], end_time=job['end_time'], duration=duration,
+                                  path=source, size=os.path.getsize(source), resolution=f"{settings['width']}x{settings['height']}",
+                                  fps=settings['fps'], station_id=settings.get('station_id', ''),
+                                  station_name=settings.get('station_name', '本机'),
+                                  capture=dict(interrupted=job['interrupted'], encoder=settings['encoder'],
+                                               audio_enabled=settings['audio_enabled'], error=job.get('last_error', ''))))
+            self.manager.on_saved(job['recording_id'])
             self.jobs.remove(job["id"])
             self._log(f"{'故障片段' if job['interrupted'] else '录像'}已保存：{source}（{duration:.1f} 秒）")
             self.notify("saved", source)

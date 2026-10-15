@@ -177,7 +177,7 @@ class VideoDB:
 
     def insert_record(self, barcode, start_time, end_time, duration,
                       video_path, file_size, resolution, fps, recording_id=None,
-                      metadata=None):
+                      metadata=None, station_id=None, station_name=None):
         record = {
             "schema_version": 2,
             "recording_id": recording_id,
@@ -193,6 +193,8 @@ class VideoDB:
         }
         if metadata:
             record["capture"] = dict(metadata)
+        if station_id:
+            record.update(station_id=station_id, station_name=station_name or '本机')
         with self.lock:
             path = self._get_json_path()
             if recording_id:

@@ -201,7 +201,7 @@ def build_command(settings, output=None, platform=None, synthetic=False):
     return args
 
 
-def probe_recording(path, settings):
+def probe_recording(path, settings, *, match_dimensions=True):
     """Require real video/audio packets, correct dimensions/codec and finalized duration."""
     ffprobe = find_tool("ffprobe", settings["ffprobe_path"])
     result = subprocess.run([ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
@@ -211,7 +211,7 @@ def probe_recording(path, settings):
     data = json.loads(result.stdout)
     video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
     audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
-    if not video or int(video.get("width", 0)) != settings["width"] or int(video.get("height", 0)) != settings["height"]:
+    if not video or (match_dimensions and (int(video.get("width", 0)) != settings["width"] or int(video.get("height", 0)) != settings["height"])):
         raise RuntimeError("录像没有视频或实际分辨率与设置不一致")
     if settings["audio_enabled"] and not audio:
         raise RuntimeError("录像缺少要求的麦克风音轨")

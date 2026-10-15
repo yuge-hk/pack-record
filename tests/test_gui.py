@@ -72,6 +72,25 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(scan.call_count, 1)
             self.assertEqual(self.window.input.text(), '')
 
+    def test_first_run_keeps_workbench_and_management_out_of_operator_flow(self):
+        QTest.qWait(150)
+        self.assertTrue(self.window.input.isVisible())
+        self.assertTrue(self.window.preview_label.isVisible())
+        self.assertFalse(self.window.library_button.isVisible())
+        self.assertFalse(self.window.wizard_button.isVisible())
+        self.assertFalse(self.window.web_button.isVisible())
+        self.assertIsNone(self.app.activeModalWidget())
+
+    def test_wide_workbench_preserves_size_for_long_plain_text_reminders(self):
+        self.assertEqual((self.window.width(), self.window.height()), (1280, 720))
+        text = '<b>买家留言</b>' + '请检查商品数量。' * 100
+        self.window._backend_event('announcement', dict(text=text, warning=True))
+        self.app.processEvents()
+        self.assertEqual(self.window.announcement_label.toPlainText(), text)
+        self.assertEqual((self.window.width(), self.window.height()), (1280, 720))
+        self.assertLess(self.window.preview_label.mapTo(self.window, self.window.preview_label.rect().topLeft()).x(),
+                        self.window.input.mapTo(self.window, self.window.input.rect().topLeft()).x())
+
     def test_fast_scanner_fallback_without_enter(self):
         with patch.object(self.window.controller, 'scan') as scan:
             QTest.keyClicks(self.window.input, 'TRACK-456')

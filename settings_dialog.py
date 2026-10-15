@@ -5,7 +5,7 @@ import threading
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QMessageBox, QPushButton, QSpinBox,
+                               QLineEdit, QMessageBox, QPushButton, QSpinBox, QPlainTextEdit,
                                QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
 from ffmpeg_backend import available_encoders, camera_modes, discover_devices
@@ -25,6 +25,24 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         layout.addWidget(tabs)
 
+        station = self._tab(tabs, '工位与中心')
+        name = QLineEdit(settings['station_name'])
+        self.fields['station_name'] = name
+        station.addRow('工位名称', name)
+        identity = QLineEdit(settings['station_id'])
+        identity.setReadOnly(True)
+        station.addRow('稳定工位 ID', identity)
+        self._combo(station, 'role', '本机职责', [('本机录像 + 中心保存', 'integrated'), ('录像工位', 'station'),
+                                               ('只做保存中心', 'center'), ('只读查看', 'viewer')])
+        self._combo(station, 'web_bind', 'Web 访问（重启生效）', [('仅本机', '127.0.0.1'), ('允许局域网', '0.0.0.0')])
+        station.addRow(QLabel('工位本地录制不依赖中心在线。后续独立 Go 中心通过版本化接口接入。'))
+        speech = self._tab(tabs, '订单播报')
+        self._check(speech, 'speech_enabled', '启用本机语音提醒')
+        self._check(speech, 'speech_quantity', '提醒多件商品数量')
+        self._check(speech, 'speech_remarks', '播报买家留言、卖家备注和商品摘要')
+        self._check(speech, 'speech_refund', '退款中 / 已退款时播报告警')
+        self._spin(speech, 'order_valid_hours', '订单信息有效小时', 1, 168)
+        speech.addRow(QLabel('当前支持手动录入和统一订单接口。平台、XLSX、油猴适配暂未启用。\n退款播报只做现场提醒，不自动改变平台出库状态。'))
         devices = self._tab(tabs, "摄像头与声音")
         self._combo(devices, "camera", "USB 摄像头", [], editable=True)
         self._combo(devices, "microphone", "麦克风", [], editable=True)
@@ -61,6 +79,23 @@ class SettingsDialog(QDialog):
 
         storage = self._tab(tabs, "文件与保护")
         self._path(storage, "record_path", "录像目录", directory=True)
+        paths = QPlainTextEdit('\n'.join(settings['record_paths']))
+        paths.setMaximumHeight(85)
+        self.fields['record_paths'] = paths
+        storage.addRow('附加录像目录（每行一个）', paths)
+        self._combo(storage, 'cleanup_policy', '自动清理策略', [('关闭自动清理', 'disabled'), ('只清理已校验上传录像', 'verified'), ('纯本地循环覆盖', 'local')])
+        self._spin(storage, 'retention_days', '本地保留天数', 1, 3650)
+        storage.addRow(QLabel('上传缓存模式始终保护未确认录像。附加目录需提前创建 / 挂载。\n达到清理水位会清理符合条件的最旧录像，录像段之间切换目录。'))
+        upload = self._tab(tabs, '上传与备份')
+        self._combo(upload, 'upload_kind', '上传目标', [('不上传', 'none'), ('目录 / 已挂载 NAS', 'directory'), ('PackRecord 保存中心', 'center')])
+        self._path(upload, 'upload_path', '上传目录', directory=True)
+        for key, label in (('upload_url', '中心地址'), ('upload_token', '中心分配的上传密钥')):
+            edit = QLineEdit(settings[key])
+            if key == 'upload_token':
+                edit.setEchoMode(QLineEdit.Password)
+            self.fields[key] = edit
+            upload.addRow(label, edit)
+        upload.addRow(QLabel('NAS 使用已挂载的 SMB/NFS 目录。中心密钥绑定本工位 ID。\nS3/WebDAV 和 PackingProof-Mobile 接入暂未启用。'))
         self._spin(storage, "max_record_minutes", "单段最长分钟数", 1, 1440)
         self._spin(storage, "disk_warn_gb", "磁盘警告阈值 GB", 1, 100000)
         self._spin(storage, "disk_critical_gb", "禁止新录像阈值 GB", 1, 100000)
@@ -145,6 +180,8 @@ class SettingsDialog(QDialog):
                 index = widget.currentIndex()
                 values[key] = (widget.itemData(index) if index >= 0 and widget.currentText() == widget.itemText(index)
                                else widget.currentText().strip())
+            elif isinstance(widget, QPlainTextEdit):
+                values[key] = [line.strip() for line in widget.toPlainText().splitlines() if line.strip()]
             elif isinstance(widget, QCheckBox):
                 values[key] = widget.isChecked()
             elif isinstance(widget, QSpinBox):

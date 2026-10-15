@@ -23,15 +23,18 @@ if "--self-test" in sys.argv:
 from PySide6.QtCore import QEvent, QLockFile, QStandardPaths, QTimer, Qt, Signal, qVersion
 from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit,
-                               QMessageBox, QPushButton, QTextEdit, QVBoxLayout, QWidget)
+                               QMessageBox, QPushButton, QTextEdit, QVBoxLayout, QWidget, QGridLayout, QScrollArea, QFrame)
 
 from ffmpeg_backend import PREVIEW_HEIGHT, PREVIEW_WIDTH, available_encoders, run_tool
 from recorder_settings import RecorderSettingsStore, find_tool, runtime_dir
 from recording_controller import RecordingController
 from settings_dialog import SettingsDialog
+from speech_engine import SpeechEngine
+from management_dialog import ManagementDialog
+from setup_wizard import SetupWizard
 
-APP_VERSION = "2.0.0"
-STATE_LABELS = dict(idle="等待扫码", starting="正在启动录制", recording="录制中",
+APP_VERSION = "2.1.0"
+STATE_LABELS = dict(testing="正在进行设备试录", idle="等待扫码", starting="正在启动录制", recording="录制中",
                     saving="正在保存", preview_starting="正在打开试拍", preview="试拍预览（不保存）",
                     disconnected="录像服务连接中断", recovering="正在恢复保存任务", fault="故障锁定", closed="已退出")
 
@@ -49,62 +52,135 @@ class RecorderApp(QWidget):
         self.scan_first = self.scan_last = None
         self.scan_buffer = ""
         self.setWindowTitle(f"打包录像 v{APP_VERSION} · FFmpeg")
-        self.resize(900, 790)
-        layout = QVBoxLayout(self)
-        self.preview_label = QLabel("先在设置中选择摄像头和麦克风，再点击试拍预览。")
+        self.resize(1280, 720)
+        self.setMinimumSize(960, 540)
+        self.setStyleSheet("""
+            RecorderApp { background: #edf1f6; color: #17243b; }
+            QLineEdit { background: white; border: 1px solid #c7d1df; border-radius: 7px; padding: 9px; }
+            QPushButton { background: white; border: 1px solid #ccd5e0; border-radius: 6px; padding: 8px; }
+            QPushButton:hover { background: #eaf1fc; border-color: #7498d2; }
+            QPushButton:disabled { color: #91a0b3; background: #f3f5f8; }
+            QTextEdit { background: #f3f6fa; border: 0; border-radius: 6px; padding: 5px; font-size: 11px; }
+        """)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(16)
+        view = QWidget()
+        view.setStyleSheet('background: #101827; border-radius: 10px; color: #d9e4f5;')
+        preview_layout = QVBoxLayout(view)
+        preview_layout.setContentsMargins(18, 18, 18, 14)
+        title = QLabel('PACKRECORD  /  打包录像')
+        title.setStyleSheet('font-size: 16px; font-weight: bold; color: #9db6d7;')
+        preview_layout.addWidget(title)
+        self.preview_label = QLabel('等待扫码')
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(640, 360)
-        self.preview_label.setStyleSheet("background: #111827; color: #e5e7eb; padding: 8px;")
-        layout.addWidget(self.preview_label, 1)
+        self.preview_label.setMinimumSize(480, 270)
+        self.preview_label.setStyleSheet('color: #b6c4d8; font-size: 18px;')
+        preview_layout.addWidget(self.preview_label, 1)
+        hint = QLabel('实时取景 · 扫码自动开始 / 切换订单录像')
+        hint.setStyleSheet('color: #7e94b3; font-size: 12px;')
+        preview_layout.addWidget(hint)
+        root.addWidget(view, 7)
+        info = QWidget()
+        info.setMinimumWidth(320)
+        info.setMaximumWidth(400)
+        sidebar = QScrollArea()
+        sidebar.setWidgetResizable(True)
+        sidebar.setFrameShape(QFrame.NoFrame)
+        sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sidebar.setMinimumWidth(340)
+        sidebar.setMaximumWidth(420)
+        sidebar.setWidget(info)
+        root.addWidget(sidebar, 3)
+        layout = QVBoxLayout(info)
+        layout.setContentsMargins(0, 2, 0, 0)
+        layout.setSpacing(10)
+        self.state_label = QLabel('等待扫码')
+        self.state_label.setStyleSheet('font-size: 25px; font-weight: bold; color: #166b55;')
+        layout.addWidget(self.state_label)
+        self.tracking_label = QLabel('当前单号：—')
+        self.tracking_label.setTextFormat(Qt.PlainText)
+        self.tracking_label.setWordWrap(True)
+        self.tracking_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.tracking_label.setStyleSheet('font-size: 21px; font-weight: bold;')
+        layout.addWidget(self.tracking_label)
         self.input = QLineEdit()
-        self.input.setPlaceholderText("扫描快递单号后回车；STOPSTOP 停止")
-        self.input.setMinimumHeight(45)
-        self.input.setStyleSheet("font-size: 22px;")
+        self.input.setPlaceholderText('扫描或输入单号，回车确认')
+        self.input.setMinimumHeight(48)
+        self.input.setStyleSheet('font-size: 17px;')
         self.input.setAttribute(Qt.WA_InputMethodEnabled, False)
         self.input.setInputMethodHints(Qt.ImhNoPredictiveText)
         self.input.returnPressed.connect(self.handle_input)
         self.input.textEdited.connect(self._scan_edited)
         layout.addWidget(self.input)
-        self.tracking_label = QLabel("当前单号：—")
-        self.tracking_label.setStyleSheet("font-size: 25px; font-weight: bold;")
-        layout.addWidget(self.tracking_label)
-        self.state_label = QLabel("等待扫码")
-        self.state_label.setStyleSheet("font-size: 20px;")
-        layout.addWidget(self.state_label)
-        self.pending_label = QLabel("最新待处理单号：—")
+        self.pending_label = QLabel('最新待处理单号：—')
+        self.pending_label.setWordWrap(True)
+        self.pending_label.setStyleSheet('color: #687b94; font-size: 12px;')
         layout.addWidget(self.pending_label)
-        self.config_label = QLabel()
-        self.config_label.setWordWrap(True)
-        layout.addWidget(self.config_label)
-        self.disk_label = QLabel()
-        layout.addWidget(self.disk_label)
-        self.fault_label = QLabel()
-        self.fault_label.setWordWrap(True)
-        self.fault_label.setStyleSheet("background: #b91c1c; color: white; padding: 10px;")
+        self.announcement_label = QTextEdit()
+        self.announcement_label.setReadOnly(True)
+        self.announcement_label.setMinimumHeight(70)
+        self.announcement_label.setMaximumHeight(140)
+        self.announcement_label.setStyleSheet('background: #fff3d7; color: #89500e; border-radius: 7px; padding: 10px; font-size: 16px;')
+        layout.addWidget(self.announcement_label)
+        self.announcement_label.hide()
+        self.fault_label = QTextEdit()
+        self.fault_label.setReadOnly(True)
+        self.fault_label.setMaximumHeight(130)
+        self.fault_label.setStyleSheet('background: #b91c1c; color: white; border-radius: 6px; padding: 10px;')
         self.fault_label.hide()
         layout.addWidget(self.fault_label)
-        buttons = QHBoxLayout()
-        self.stop_button = QPushButton("停止并保存")
+        buttons = QGridLayout()
+        buttons.setSpacing(8)
+        self.stop_button = QPushButton('停止并保存')
+        self.stop_button.setStyleSheet('background: #2164c8; color: white; border: 0; padding: 10px;')
         self.stop_button.clicked.connect(self.stop)
-        self.preview_button = QPushButton("试拍预览")
+        self.preview_button = QPushButton('试拍预览')
         self.preview_button.clicked.connect(self.preview)
-        self.settings_button = QPushButton("设置")
-        self.settings_button.clicked.connect(self.open_settings)
-        self.retry_button = QPushButton("修复后重试原单号")
+        self.settings_button = QPushButton('设置 · Web')
+        self.settings_button.clicked.connect(self.open_web)
+        self.recover_button = QPushButton('恢复保存任务')
+        self.recover_button.clicked.connect(self.recover)
+        for i, button in enumerate((self.stop_button, self.preview_button, self.settings_button, self.recover_button)):
+            buttons.addWidget(button, i // 2, i % 2)
+        self.retry_button = QPushButton('修复后重试原单号')
         self.retry_button.clicked.connect(self.retry_fault)
         self.retry_button.hide()
-        self.recover_button = QPushButton("恢复保存任务")
-        self.recover_button.clicked.connect(self.recover)
-        for button in (self.stop_button, self.preview_button, self.settings_button, self.retry_button, self.recover_button):
-            buttons.addWidget(button)
+        buttons.addWidget(self.retry_button, 2, 0, 1, 2)
         layout.addLayout(buttons)
-        self.progress_label = QLabel("录制帧数：—")
+        stop_hint = QLabel('扫描 STOPSTOP 也可停止并保存')
+        stop_hint.setStyleSheet('font-size: 11px; color: #687b94;')
+        layout.addWidget(stop_hint)
+        layout.addStretch(1)
+        self.config_label = QLabel()
+        self.config_label.setWordWrap(True)
+        self.config_label.setStyleSheet('font-size: 11px; color: #6a7b92;')
+        layout.addWidget(self.config_label)
+        self.disk_label = QLabel()
+        self.disk_label.setWordWrap(True)
+        self.disk_label.setStyleSheet('font-size: 12px;')
+        layout.addWidget(self.disk_label)
+        self.progress_label = QLabel('录制帧数：—')
+        self.progress_label.setStyleSheet('font-size: 11px; color: #6a7b92;')
         layout.addWidget(self.progress_label)
         self.logs = QTextEdit()
         self.logs.setReadOnly(True)
         self.logs.document().setMaximumBlockCount(300)
-        self.logs.setMaximumHeight(140)
+        self.logs.setMaximumHeight(100)
         layout.addWidget(self.logs)
+        advanced_widget = QWidget()
+        management = QVBoxLayout(advanced_widget)
+        self.library_button = QPushButton('录像与存储管理')
+        self.library_button.clicked.connect(self.open_management)
+        management.addWidget(self.library_button)
+        self.wizard_button = QPushButton('配置向导')
+        self.wizard_button.clicked.connect(self.open_wizard)
+        management.addWidget(self.wizard_button)
+        self.web_button = QPushButton('打开本机 Web')
+        self.web_button.clicked.connect(self.open_web)
+        management.addWidget(self.web_button)
+        layout.addWidget(advanced_widget)
+        advanced_widget.hide()
         log_dir = self.base_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger(f"recorder-{id(self)}")
@@ -113,6 +189,8 @@ class RecorderApp(QWidget):
                                               backupCount=5, encoding="utf-8")
         self.log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         self.logger.addHandler(self.log_handler)
+        self.speech = SpeechEngine(self)
+        self.speech.unavailable.connect(self.log)
         self.backend_event.connect(self._backend_event, Qt.QueuedConnection)
         self.controller = controller_factory(self.settings, self.base_dir, self.backend_event.emit)
         self.scan_timer = QTimer(self)
@@ -125,6 +203,8 @@ class RecorderApp(QWidget):
         self.disk_timer.timeout.connect(self.update_storage)
         self.disk_timer.start(3000)
         QShortcut(QKeySequence("Ctrl+,"), self, activated=self.open_settings)
+        QShortcut(QKeySequence('Ctrl+Shift+M'), self, activated=self.open_management)
+        QShortcut(QKeySequence('Ctrl+Shift+W'), self, activated=self.open_wizard)
         QApplication.instance().installEventFilter(self)
         self._update_config()
         self.update_storage()
@@ -253,15 +333,48 @@ class RecorderApp(QWidget):
                 QMessageBox.warning(self, "设置未保存", str(error))
         self.focus_scan()
 
+    def open_management(self):
+        dialog = ManagementDialog(self.controller, self)
+        dialog.exec()
+        dialog.close()
+
+    def open_wizard(self):
+        if self.controller.snapshot()['state'] not in ('idle', 'fault') or self.controller.settings['role'] == 'viewer':
+            QMessageBox.information(self, '请先停止', '请先停止录制，再运行管理员配置向导。')
+            return
+        dialog = SetupWizard(self)
+        dialog.exec()
+        self.settings = dict(self.controller.settings)
+        self._update_config()
+
+    def open_web(self):
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        if hasattr(self.controller, 'client'):
+            url = self.controller.client.base
+        else:
+            url = getattr(self, 'web_url', '')
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+        else:
+            QMessageBox.information(self, 'Web 服务', '从程序入口启动或连接后台后可打开 Web 管理。')
+
     def _update_config(self):
         s = self.settings
-        self.config_label.setText(f"{s['width']}×{s['height']} · {s['fps']} FPS · {s['encoder']} · "
+        if s.get('role') == 'viewer':
+            self.config_label.setText(f"{s['station_name']} · 只读查看，请在 Web 中检索和回放录像")
+            return
+        role = dict(integrated='本机录像与保存', station='录像工位', center='保存中心').get(s['role'], s['role'])
+        self.config_label.setText(f"{s['station_name']} · {role}\n{s['width']}×{s['height']} · {s['fps']} FPS · {s['encoder']} · "
                                   f"{'带麦克风声音' if s['audio_enabled'] else '无声音'} · MKV\n"
                                   f"摄像头：{s['camera'] or '未选择'} · 麦克风：{s['microphone'] or '未选择'}")
 
     def update_storage(self):
         try:
             if getattr(self.controller, 'remote', False):
+                if self.settings.get('role') == 'viewer':
+                    self.disk_label.setText('只读查看端')
+                    return
                 storage = self.controller.status['storage']
                 remaining = self.controller.jobs.count()
                 def space(value):
@@ -270,7 +383,10 @@ class RecorderApp(QWidget):
                 self.recover_button.setText(f"恢复保存任务（{remaining}）")
                 return
             path = Path(self.settings["record_path"])
-            path.mkdir(parents=True, exist_ok=True)
+            if not self.controller.storage.volume_valid(path):
+                self.disk_label.setText('录像目录或磁盘标识不可用，请管理员检查挂载' if self.settings.get('setup_complete') else
+                                       '请通过“设置”打开 Web，完成设备和保存目录配置')
+                return
             staging = self.base_dir / "recordings-in-progress"
             staging.mkdir(parents=True, exist_ok=True)
             archive_gb = shutil.disk_usage(path).free / 1024**3
@@ -290,6 +406,11 @@ class RecorderApp(QWidget):
             return
         if kind == "state":
             state = data["state"]
+            if data['current'] != getattr(self, 'announcement_tracking', None):
+                self.announcement_tracking = data['current']
+                self.announcement_label.clear()
+                self.announcement_label.hide()
+                self.speech.clear()
             self.tracking_label.setText(f"当前单号：{data['current'] or data['fault_tracking'] or '—'}")
             self.pending_label.setText(f"最新待处理单号：{data['pending'] or '—'}")
             self.state_label.setText(STATE_LABELS.get(state, state))
@@ -297,18 +418,25 @@ class RecorderApp(QWidget):
             self.fault_label.setVisible(fault)
             self.retry_button.setVisible(fault)
             self.retry_button.setEnabled(state == "fault" and self.controller.session is None and not self.exiting)
-            self.fault_label.setText(f"扫码已锁定，保留单号：{data['fault_tracking'] or '—'}\n{data['error'][:1500]}")
-            self.input.setEnabled(state not in ("fault", "disconnected", "closed") and not fault and not self.exiting)
-            configurable = state in ("idle", "fault") and self.controller.session is None and not data["pending"] and not self.exiting
+            self.fault_label.setPlainText(f"扫码已锁定，保留单号：{data['fault_tracking'] or '—'}\n{data['error'][:1500]}")
+            self.input.setEnabled(self.controller.settings["role"] in ("integrated", "station") and state not in ("fault", "disconnected", "closed", "testing") and not fault and not self.exiting)
+            configurable = state in ("idle", "fault") and self.controller.session is None and not data["pending"] and not self.exiting and self.controller.settings["role"] != "viewer"
             self.settings_button.setEnabled(configurable)
             self.recover_button.setEnabled(configurable)
-            self.preview_button.setEnabled(state == "idle" and configurable)
-            self.stop_button.setEnabled(state not in ("fault", "closed", "recovering", "disconnected") and not self.exiting)
+            self.preview_button.setEnabled(state == "idle" and configurable and self.controller.settings["role"] in ("integrated", "station"))
+            self.stop_button.setEnabled(self.controller.settings["role"] in ("integrated", "station") and state not in ("fault", "closed", "recovering", "disconnected", "testing") and not self.exiting)
             if state == "disconnected":
                 self.preview_label.setText("与录像服务断开，正在重连…")
             if state in ("idle", "fault") and self.controller.session is None:
                 self.preview_label.clear()
                 self.preview_label.setText("等待扫码" if state == "idle" else "采集故障，请检查设备和设置")
+        elif kind == 'announcement':
+            if self.settings.get('role') in ('integrated', 'station'):
+                self.announcement_label.setPlainText(data['text'])
+                self.announcement_label.show()
+                self.speech.say(data)
+                if data.get('warning'):
+                    QApplication.beep()
         elif kind == "log":
             self.log(str(data))
         elif kind == "beep":
@@ -327,6 +455,10 @@ class RecorderApp(QWidget):
         if frame is not None:
             image = QImage(frame, PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_WIDTH * 3, QImage.Format_RGB888).copy()
             self.preview_label.setPixmap(QPixmap.fromImage(image).scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
+        live_settings = self.controller.settings
+        if live_settings != self.settings:
+            self.settings = dict(live_settings)
+            self._update_config()
         snapshot = self.controller.snapshot()
         if snapshot["started_monotonic"] and snapshot["state"] == "recording":
             elapsed = int(time.monotonic() - snapshot["started_monotonic"])
@@ -341,6 +473,7 @@ class RecorderApp(QWidget):
             QApplication.instance().removeEventFilter(self)
             self.tick_timer.stop()
             self.disk_timer.stop()
+            self.speech.close()
             self.log_handler.close()
             self.logger.removeHandler(self.log_handler)
             event.accept()
@@ -416,6 +549,8 @@ def main():
     parser.add_argument('--data-dir', type=Path, default=runtime_dir())
     parser.add_argument('--port', type=int, default=18765)
     parser.add_argument('--token-file', type=Path)
+    parser.add_argument('--server-url', help='查看或管理其他 PackRecord 节点')
+    parser.add_argument('--host', choices=('127.0.0.1', '0.0.0.0'))
     parser.add_argument('--self-test', action='store_true')
     args = parser.parse_args()
     app = QApplication([sys.argv[0]])
@@ -431,11 +566,12 @@ def main():
         QMessageBox.warning(None, "程序已运行", "这个目录中的发货录像程序已经运行。")
         return 1
     data_lock = None
+    server = server_thread = None
     try:
         if args.connect:
             from service_client import ServiceClient, RemoteController, RemoteSettingsStore
             token = (args.token_file or base / 'service.token').read_text().strip()
-            client = ServiceClient(token, args.port)
+            client = ServiceClient(token, args.port, args.server_url)
             window = RecorderApp(base, lambda settings, directory, notify:
                                  RemoteController(settings, directory, notify, client),
                                  RemoteSettingsStore(client, base))
@@ -444,7 +580,19 @@ def main():
             data_lock = DataLock(base)
             data_lock.__enter__()
             window = RecorderApp(base)
+            import threading
+            from recorder_service import RecorderService, RecorderHTTPServer, load_token
+            service = RecorderService(base, controller=window.controller)
+            server = RecorderHTTPServer((args.host or window.settings['web_bind'], args.port), service,
+                                        load_token(base), load_token(base, 'viewer.token'))
+            server_thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .2}, daemon=True)
+            server_thread.start()
+            window.web_url = f'http://127.0.0.1:{server.server_port}'
+            window.controller.manager.viewer_access = lambda: dict(viewer_token=server.viewer_token)
     except Exception as error:
+        if 'window' in locals():
+            window.controller.close()
+            window.controller.thread.join()
         if data_lock:
             data_lock.__exit__()
         QMessageBox.critical(None, "无法启动", f"请检查服务连接或数据目录权限。\n{error}")
@@ -453,6 +601,10 @@ def main():
     try:
         return app.exec()
     finally:
+        if server:
+            server.shutdown()
+            server.server_close()
+            server_thread.join()
         window.controller.close()
         window.controller.thread.join()
         lock.unlock()

@@ -1,0 +1,8 @@
+<script setup lang="ts">
+import { reactive,ref } from 'vue'
+import { useConsole } from './context'
+const {api,run,notify}=useConsole(),saving=ref(false)
+const order=reactive({tracking_number:'',quantity:1,buyer_remark:'',seller_remark:'',product_summary:'',refund_status:'unknown',source:'manual'})
+async function save(){saving.value=true;try{await api.request('/v1/orders',{orders:[order]});notify('订单已保存，匹配单号实际开始录制时由本机桌面播报。')}finally{saving.value=false}}
+</script>
+<template><section class="card"><div class="section-title"><div><h2>录入订单提醒</h2><p class="muted">让打包工位在扫码后提醒商品数量、买家留言和退款状态。</p></div><span class="badge">本机语音</span></div><form @submit.prevent="run(save)"><div class="form-grid"><label>快递单号<input id="ordercode" v-model="order.tracking_number" required maxlength="256" placeholder="需与扫码单号一致"></label><label>商品总件数<input id="quantity" v-model.number="order.quantity" type="number" min="1" max="10000" required></label><label>买家留言<textarea id="buyer" v-model="order.buyer_remark" rows="3" maxlength="1000" placeholder="例如：易碎品请加固"></textarea></label><label>卖家备注<textarea v-model="order.seller_remark" rows="3" maxlength="1000"></textarea></label><label>商品摘要<input v-model="order.product_summary" maxlength="1000"></label><label>退款状态<select v-model="order.refund_status"><option value="unknown">未知</option><option value="none">无退款</option><option value="pending">退款中</option><option value="refunded">已退款</option></select></label></div><div class="form-actions"><button id="saveorder" class="primary" :disabled="saving">保存订单提醒</button></div></form></section><div class="info-note"><strong>数据接入预留</strong><p>XLSX、电商平台和油猴适配留待后续，目前可手动录入或调用订单接口。退款播报用于提醒核对，不代替平台出库控制。</p></div></template>

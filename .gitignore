@@ -40,3 +40,12 @@ Thumbs.db
 service.token
 service.lock
 station-data/
+
+.station-id
+exports/
+viewer.token
+setup-tests/
+
+# Vue console dependencies and generated static build
+web/node_modules/
+web/dist/

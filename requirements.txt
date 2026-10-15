@@ -1,1 +1,2 @@
 PySide6-Essentials>=6.8,<7
+PySide6-Addons>=6.8,<7

@@ -9,8 +9,8 @@ from ffmpeg_backend import FRAME_BYTES
 
 
 class ServiceClient:
-    def __init__(self, token, port=DEFAULT_PORT):
-        self.base = f'http://127.0.0.1:{port}'
+    def __init__(self, token, port=DEFAULT_PORT, base_url=None):
+        self.base = (base_url or f'http://127.0.0.1:{port}').rstrip('/')
         self.token = token
         self.opener = build_opener(ProxyHandler({}))
 
@@ -55,6 +55,7 @@ class RemoteController:
         self.status = client.request('/v1/status')
         self.settings = self.status['settings']
         self.jobs = RemoteJobs(self)
+        self.manager = RemoteManager(client)
         self.sequence = self.status['sequence']
         self.session = object() if self.status['snapshot']['session_active'] else None
         self.frame, self.frame_id = None, None
@@ -69,6 +70,7 @@ class RemoteController:
             try:
                 status = self.client.request(f'/v1/status?after={self.sequence}')
                 self.status = status
+                self.settings = status['settings']
                 self.sequence = status['sequence']
                 self.session = True if status['snapshot']['session_active'] else None
                 for event in status['events']:
@@ -79,8 +81,9 @@ class RemoteController:
                     self.notify('log', '已重新连接本机录像服务')
                 disconnected = False
                 self.disconnected = False
-                frame_id, frame = self.client.request('/v1/frame', raw=True)
-                self.frame_id, self.frame = frame_id, frame if len(frame) == FRAME_BYTES else None
+                if self.settings.get('role') != 'viewer':
+                    frame_id, frame = self.client.request('/v1/frame', raw=True)
+                    self.frame_id, self.frame = frame_id, frame if len(frame) == FRAME_BYTES else None
             except Exception as error:
                 self.frame = None
                 if not disconnected:
@@ -148,3 +151,60 @@ class RemoteSettingsStore:
 
     def save(self, values):
         return dict(values)  # configure() already persisted through the service.
+
+
+class RemoteManager:
+    def __init__(self, client):
+        self.client = client
+
+    def search(self, **kwargs):
+        from urllib.parse import urlencode
+        names = {'date_from': 'from', 'date_to': 'to', 'include_deleted': 'deleted'}
+        return self.client.request('/v1/library?' + urlencode({names.get(k, k): v for k, v in kwargs.items() if v != ''}))
+
+    def status(self):
+        return self.client.request('/v1/management')
+
+    def create_export(self, record_id, start=0, end=None):
+        return self.client.request('/v1/exports', dict(record_id=record_id, start=start, end=end))
+
+    def export(self, identifier):
+        return self.client.request('/v1/exports/' + identifier)
+
+    def media_ticket(self, record_id=None, export_id=None, test_id=None):
+        result = self.client.request('/v1/playback', dict(record_id=record_id, export_id=export_id, test_id=test_id))
+        result['url'] = self.client.base + result['url']
+        return result
+
+    def release_media(self, ticket):
+        return self.client.request('/v1/playback/release', dict(ticket=ticket['url'].rsplit('/', 1)[1]))
+
+    def cleanup(self):
+        return self.client.request('/v1/cleanup', {})
+
+    def queue_uploads(self):
+        return self.client.request('/v1/uploads/queue', {})
+
+    def retry_uploads(self):
+        return self.client.request('/v1/uploads/retry', {})
+
+    def save_orders(self, orders):
+        return self.client.request('/v1/orders', dict(orders=orders))
+
+    def issue_device(self, station_id, name):
+        return self.client.request('/v1/devices', dict(station_id=station_id, name=name))
+
+    def revoke_device(self, station_id):
+        return self.client.request('/v1/devices/revoke', dict(station_id=station_id))
+
+    def viewer_access(self):
+        return self.client.request('/v1/access', {})
+
+    def diagnostic(self):
+        return self.client.request('/v1/setup/test', {})
+
+    def test_result(self, identifier):
+        return self.client.request('/v1/tests/' + identifier)
+
+    def complete_setup(self, test_id=None):
+        return self.client.request('/v1/setup/complete', dict(test_id=test_id))
