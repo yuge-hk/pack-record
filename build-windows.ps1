@@ -25,8 +25,9 @@ if (-not $SkipDependencyInstall) {
     python -m pip install -r requirements-build.txt
     if ($LASTEXITCODE -ne 0) { throw "构建依赖安装失败" }
 }
+$versionFile = (Resolve-Path (Join-Path $PSScriptRoot "build\windows_version_info.txt")).Path
 python -m PyInstaller --noconfirm --clean --onefile --windowed `
-    --name "pack-record" --specpath build --version-file "build\windows_version_info.txt" "main.py"
+    --name "pack-record" --specpath build --version-file $versionFile "main.py"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 构建失败" }
 $release = Join-Path "dist" "pack-record-v2.0.0-windows-x64"
 New-Item -ItemType Directory -Force -Path $release | Out-Null
