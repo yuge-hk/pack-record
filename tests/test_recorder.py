@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -29,7 +30,7 @@ class SettingsAndCommandTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.store = RecorderSettingsStore(self.directory.name)
         self.settings = self.store.defaults()
-        self.settings.update(ffmpeg_path='/bin/echo', camera='USB Camera', microphone='USB Microphone')
+        self.settings.update(ffmpeg_path=sys.executable, camera='USB Camera', microphone='USB Microphone')
 
     def test_defaults_and_obs_settings_are_preserved(self):
         legacy = Path(self.directory.name) / 'settings.json'
@@ -92,7 +93,7 @@ class SettingsAndCommandTests(unittest.TestCase):
         self.assertEqual(devices['audio'][0][1], '@device_audio_1')
 
     def test_probe_rejects_header_only_audio(self):
-        self.settings['ffprobe_path'] = '/bin/echo'
+        self.settings['ffprobe_path'] = sys.executable
         media = dict(streams=[dict(index=0, codec_type='video', codec_name='hevc', width=2560, height=1440),
                               dict(index=1, codec_type='audio')], format=dict(duration='1.5'))
         responses = [subprocess.CompletedProcess([], 0, json.dumps(media).encode(), b''),
@@ -139,7 +140,7 @@ class ControllerTests(unittest.TestCase):
         self.encoders = patch('recording_controller.available_encoders', return_value={'hevc_qsv'})
         self.encoders.start()
         self.addCleanup(self.encoders.stop)
-        self.tools = patch('recording_controller.find_tool', return_value='/bin/echo')
+        self.tools = patch('recording_controller.find_tool', return_value=sys.executable)
         self.tools.start()
         self.addCleanup(self.tools.stop)
         self.probe = patch('recording_controller.probe_recording', return_value=1.5)
